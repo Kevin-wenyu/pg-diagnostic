@@ -5,11 +5,27 @@
 # PostgreSQL Database Diagnostic Tool (pg)
 # Production-ready for PostgreSQL 9.6-18
 #
-# Version: 4.1.3 (2026-03-26)
-# Previous Version: 4.1.2 (2026-03-26)
+# Version: 4.2.0 (2026-03-27)
+# Previous Version: 4.1.6 (2026-03-27)
 # Author: Kevin
 #
 # Version History:
+# 4.2.0 (2026-03-27) - Architecture optimization and new features:
+#                       - Deprecated redundant commands: enterprise_monitor, quick_diag, problem_summary, alerts, perf_insights
+#                       - Added --json global option for JSON output
+#                       - Added snapshot feature: pg snap save/diff/list/delete
+#                       - Added configuration tuning: pg tune score/recommendations/check
+#                       - Added deprecated command warnings with migration hints
+# 4.1.6 (2026-03-27) - Enhanced config command:
+#                       - Improved config: exact match shows detailed info (default, min, max, needs_restart)
+#                       - Added usage hint when no parameter provided
+#                       - Added fuzzy pattern matching support (e.g., pg config shared%)
+#                       - Better error messages when no matches found
+# 4.1.5 (2026-03-27) - New feature:
+#                       - Added explain analyze: execute query and show both plan and results
+# 4.1.4 (2026-03-27) - Bug fixes:
+#                       - Fixed explain/explain_json: removed incorrect q_sanitize call that corrupted SQL syntax
+#                       - Fixed ts_size: added privilege check with user-friendly warning for non-superuser
 # 4.1.3 (2026-03-26) - Command consistency and calculation fixes:
 #                       - Fixed health: Unused Indexes count now matches unused_indexes
 #                       - Fixed health: Uptime shows actual runtime not WAL written
@@ -71,8 +87,12 @@
 # 3.0.0 (2026-03-16) - Initial production-ready release
 #
 
-readonly TOOL_VERSION="4.1.3"
-readonly TOOL_BUILD_DATE="2026-03-26"
+readonly TOOL_VERSION="4.2.0"
+readonly TOOL_BUILD_DATE="2026-03-27"
+
+# Global settings
+OUTPUT_FORMAT="table"  # table or json
+SNAP_DIR="${HOME}/.pg_snapshots"
 
 PG_VERSION=""
 PG_MAJOR_VERSION=""
@@ -489,9 +509,51 @@ Commands:
     toast_tables            TOAST table sizes
 
   === configuration ===
-    config [pattern]        Show settings (optional filter)
+    config [parameter]      Show setting (exact match with details)
+    config <pattern>        Search settings by pattern
     config_diff             Non-default settings
     reload                  Reload configuration
+
+  === SNAPSHOT (New in 4.2.0) ===
+    snap save <name>        Save statistics snapshot
+    snap list               List snapshots
+    snap diff <n1> <n2>     Compare two snapshots
+    snap delete <name>      Delete snapshot
+
+  === TUNING (New in 4.2.0) ===
+    tune score              Configuration score (0-100)
+    tune recommendations    Tuning recommendations
+    tune check              Check dangerous settings
+    tune apply <k> <v>      Generate ALTER statement
+
+  === WORKFLOW (Intelligent Diagnosis) ===
+    workflow auto           Auto-detect database issues
+    workflow slow_query     Deep diagnosis for slow queries
+    workflow lock           Diagnose lock/blocking issues
+    workflow connection     Diagnose connection issues
+    workflow io             Diagnose I/O performance
+    workflow full           Complete comprehensive diagnosis
+
+  === SQL DIAGNOSIS ===
+    sqlcheck "<sql>"        Analyze SQL query performance
+    sqlcheck --file <path>  Analyze SQL from file
+    sqlcheck --compare      Compare two SQL statements
+
+  === REPORT GENERATION ===
+    report health           Generate health report
+    report performance      Generate performance report
+    report full             Generate complete report
+    report --format html    Output as HTML
+    report --format markdown Output as Markdown
+    report --output <file>  Save to file
+
+  === MONITORING ===
+    monitor start [sec]     Start background monitoring
+    monitor stop            Stop monitoring
+    monitor status          Show monitor status
+    monitor log             Show monitor log
+    monitor alert           Show alert history
+    monitor watch <metric>  Real-time metric watch
 
   === SCHEMA INFO ===
     tables [pattern]        List tables
@@ -555,6 +617,7 @@ Commands:
     histogram_stats <tbl>   Histogram statistics
     parallel_efficiency     Parallel efficiency metrics
     explain "<sql>"         Explain query plan
+    explain analyze "<sql>" Explain and execute query
     explain_json "<sql>"    Explain as JSON
 
   === UTILITY ===
@@ -569,22 +632,21 @@ Commands:
     table_stats <table>      Table statistics
     session_stats            Session statistics by user/app
 
-  === ENTERPRISE MONITORING ===
-    enterprise_monitor      Enterprise monitoring dashboard
-    sla_tracker             SLA tracking
-    alert_engine            Alert engine
+  === SECURITY ===
+    users                   List users
+    roles                   List roles
+    permissions             Object permissions
+    privilege_audit         Privilege audit
+    security_checks         Security configuration checks
+    user_access_pattern     User access patterns
 
-  === ENTERPRISE SECURITY ===
-    security_scan           Security scan
-    compliance_check        Compliance checking
+  === HEALTH CHECK ===
+    health                  Quick health check
+    overview                System overview
+    uptime                  Server uptime
 
-  === PRODUCTION DIAGNOSIS ===
-    quick_diag              Quick diagnostic summary
-    problem_summary         Problem summary
-    perf_insights           Performance insights
-    emergency_stop          Emergency stop procedures
-    alerts                  Alert status
-    diagnose <scenario>     Combined diagnosis for common DBA scenarios
+  === DIAGNOSE SCENARIOS ===
+    diagnose <scenario>     Combined diagnosis (health/performance/connection/blocking/replication/slow/capacity)
 
 Examples:
   $EXEC_NAME ps
@@ -606,6 +668,7 @@ while [[ $# -gt 0 ]]; do
     -d|--dbname)   DBNAME="$2"; shift 2 ;;
     -P|--password-file) USE_PASSWORD_FILE="$2"; shift 2 ;;
     -n|--top)      TOP_N="$2"; shift 2 ;;
+    --json)        OUTPUT_FORMAT="json"; shift ;;
     --help)        usage ;;
     *)             break ;;
   esac
@@ -657,6 +720,24 @@ q()
     return $exit_code
   fi
   echo "$result"
+}
+
+# JSON output helper - convert table output to JSON
+q_json()
+{
+  local query="$1"
+  local result
+  result=$(echo "$query" | $PSQL_CMD -t -A -F "|" 2>&1)
+  local exit_code=$?
+  if [ $exit_code -ne 0 ]; then
+    echo "Error: Query failed" >&2
+    return $exit_code
+  fi
+  # Simple JSON conversion (header + rows)
+  echo "{"
+  echo "  \"query\": \"$query\","
+  echo "  \"result\": \"$result\""
+  echo "}"
 }
 
 # Scalar value query - returns single value without headers
@@ -732,37 +813,6 @@ cmd_running()
      FROM pg_stat_activity 
      WHERE state = 'active' AND query NOT LIKE '%pg_stat_activity%'
      ORDER BY query_start LIMIT $limit;"
-}
-
-cmd_blocking()
-{
-  local result
-  result=$(q "SELECT
-    blocked_locks.pid AS blocked_pid,
-    blocked_activity.usename AS blocked_user,
-    blocking_locks.pid AS blocking_pid,
-    blocking_activity.usename AS blocking_user,
-    blocked_activity.query AS blocked_statement,
-    blocking_activity.query AS current_statement_in_blocking_process,
-    blocked_activity.application_name AS blocked_application
-  FROM pg_catalog.pg_locks blocked_locks
-    JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
-    JOIN pg_catalog.pg_locks blocking_locks
-      ON blocking_locks.locktype = blocked_locks.locktype
-      AND blocking_locks.DATABASE IS NOT DISTINCT FROM blocked_locks.DATABASE
-      AND blocking_locks.relation IS NOT DISTINCT FROM blocked_locks.relation
-      AND blocking_locks.page IS NOT DISTINCT FROM blocked_locks.page
-      AND blocking_locks.tuple IS NOT DISTINCT FROM blocked_locks.tuple
-      AND blocking_locks.virtualxid IS NOT DISTINCT FROM blocked_locks.virtualxid
-      AND blocking_locks.transactionid IS NOT DISTINCT FROM blocked_locks.transactionid
-      AND blocking_locks.classid IS NOT DISTINCT FROM blocked_locks.classid
-      AND blocking_locks.objid IS NOT DISTINCT FROM blocked_locks.objid
-      AND blocking_locks.objsubid IS NOT DISTINCT FROM blocked_locks.objsubid
-      AND blocking_locks.pid != blocked_locks.pid
-    JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
-  WHERE NOT blocked_locks.GRANTED;")
-
-  handle_empty "$result" "No blocking sessions detected"
 }
 
 # ============================================
@@ -930,29 +980,6 @@ cmd_sql()
 # SLOW QUERY ANALYSIS
 # ============================================
 
-cmd_slow()
-{
-  local threshold="${1:-5}"
-
-  if ! require_extension pg_stat_statements; then
-    return 1
-  fi
-
-  local result
-  result=$(run_stat_statements "SELECT pid, now() - pg_stat_activity.query_start AS duration, query
-    FROM pg_stat_activity
-    WHERE (pg_stat_activity.state != 'idle' AND pg_stat_activity.state != 'idle in transaction')
-      AND pg_stat_activity.query_start IS NOT NULL
-      AND now() - pg_stat_activity.query_start > interval '$threshold seconds'
-    ORDER BY duration DESC;" 2>&1)
-
-  handle_empty "$result" "No queries running longer than $threshold seconds"
-}
-
-# ============================================
-# ENHANCED SLOW QUERY DIAGNOSIS
-# ============================================
-
 cmd_slow_enhanced()
 {
   local pid="$1"
@@ -1059,6 +1086,7 @@ analyze_specific_query()
   echo "  pg cancel $pid     - Cancel the query"
   echo "  pg kill $pid       - Terminate the session"
   echo "  pg explain <sql>   - Get execution plan (copy query text)"
+  echo "  pg explain analyze <sql> - Get plan AND execute query"
 }
 
 interpret_wait_event()
@@ -1330,11 +1358,6 @@ cmd_vacuum_status()
      WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
      ORDER BY n_dead_tup DESC
      LIMIT 20;"
-}
-
-cmd_dead_tuples()
-{
-  cmd_bloat "$@"
 }
 
 cmd_vacuum_progress()
@@ -1626,9 +1649,30 @@ cmd_db_size()
 
 cmd_ts_size()
 {
-  q "SELECT spcname AS tablespace, 
+  # Check if user has permission to access tablespace information
+  local is_superuser
+  is_superuser=$(q_scalar "SELECT current_setting('is_superuser');" 2>/dev/null)
+  if [ "$is_superuser" != "on" ]; then
+    msg_warn "Tablespace information requires superuser privileges"
+    msg_info "Showing only user tablespaces (may be limited)"
+    # Try to get tablespace info with fallback for non-superuser
+    local result
+    result=$(q "SELECT spcname AS tablespace,
+           pg_size_pretty(pg_tablespace_size(spcname)) AS size
+         FROM pg_tablespace
+         WHERE spcname NOT IN ('pg_global', 'pg_default')
+         ORDER BY pg_tablespace_size(spcname) DESC;" 2>&1)
+    if [ $? -ne 0 ]; then
+      msg_error "Cannot access tablespace information - requires superuser privileges"
+      return 1
+    fi
+    echo "$result"
+    return 0
+  fi
+
+  q "SELECT spcname AS tablespace,
        pg_size_pretty(pg_tablespace_size(spcname)) AS size
-     FROM pg_tablespace 
+     FROM pg_tablespace
      ORDER BY pg_tablespace_size(spcname) DESC;"
 }
 
@@ -1649,12 +1693,113 @@ cmd_schema_size()
 
 cmd_config()
 {
-  local pattern="${1:-%}"
+  local pattern="${1:-}"
+
+  # Show usage if no pattern provided
+  if [ -z "$pattern" ]; then
+    colorize blue "=== CONFIGURATION QUERY ==="
+    echo ""
+    echo "Usage: pg config <parameter>"
+    echo "       pg config <pattern>%"
+    echo ""
+    echo "Examples:"
+    echo "  pg config shared_buffers     # Exact match"
+    echo "  pg config shared%            # Pattern match"
+    echo "  pg config autovacuum         # All autovacuum related"
+    echo "  pg config work_mem           # Single parameter with details"
+    echo ""
+    msg_info "Showing all parameters... (use Ctrl+C to cancel)"
+    echo ""
+    pattern="%"
+  fi
+
   local sanitized=$(q_sanitize "$pattern")
-  q "SELECT name, setting, unit, source, context
+
+  colorize blue "=== CONFIGURATION SETTINGS ==="
+  echo ""
+
+  # Show exact match first if found
+  local exact_match
+  exact_match=$(q "SELECT name, setting, unit, source, context, short_desc
+     FROM pg_settings
+     WHERE name = '$sanitized'
+     LIMIT 1;" 2>/dev/null)
+
+  # Count rows in exact match result
+  local exact_row_count=0
+  exact_row_count=$(echo "$exact_match" | grep -c "|" 2>/dev/null || echo 0)
+
+  if [ "$exact_row_count" -ge 2 ]; then
+    colorize green "EXACT MATCH:"
+    echo "$exact_match"
+    echo ""
+
+    # Show detailed info for exact match
+    local detailed
+    detailed=$(q "SELECT
+       name AS parameter,
+       setting AS current_value,
+       COALESCE(unit, '') AS unit,
+       boot_val AS default_value,
+       COALESCE(min_val, '') AS min_value,
+       COALESCE(max_val, '') AS max_value,
+       category,
+       context,
+       source,
+       CASE WHEN pending_restart THEN 'YES' ELSE 'NO' END AS needs_restart,
+       short_desc AS description
+     FROM pg_settings
+     WHERE name = '$sanitized';" 2>/dev/null)
+
+    if [ -n "$detailed" ]; then
+      colorize yellow "DETAILED INFORMATION:"
+      echo "$detailed"
+      echo ""
+    fi
+  fi
+
+  # Show all matching parameters
+  local all_matches
+  all_matches=$(q "SELECT
+       name AS parameter,
+       setting AS value,
+       COALESCE(unit, '') AS unit,
+       category,
+       context,
+       source
      FROM pg_settings
      WHERE name LIKE '%$sanitized%'
-     ORDER BY name;"
+     ORDER BY category, name;" 2>/dev/null)
+
+  # Count actual data rows (excluding header and footer)
+  local row_count
+  row_count=$(echo "$all_matches" | grep -c "|" 2>/dev/null || echo 0)
+
+  # Check if exact match has actual data (check if there's a row with actual values)
+  local exact_has_data=false
+  local exact_row_count
+  exact_row_count=$(echo "$exact_match" | grep -c "|" 2>/dev/null || echo 0)
+  if [ "$exact_row_count" -ge 2 ]; then
+    exact_has_data=true
+  fi
+
+  if [ "$row_count" -gt 2 ] || [ "$exact_has_data" = true ]; then
+    # Only show "ALL MATCHING" header if there are more results than just the exact match
+    if [ "$exact_has_data" = true ] && [ "$row_count" -gt 3 ]; then
+      colorize yellow "ALL MATCHING PARAMETERS:"
+    fi
+    # Only output if there's data to show (more than just header+footer)
+    if [ "$row_count" -ge 2 ]; then
+      echo "$all_matches"
+    fi
+  else
+    # Only show warning if no exact match and no pattern matches
+    if [ "$exact_has_data" = false ]; then
+      msg_warn "No parameters found matching '$pattern'"
+      msg_info "Try: pg config shared%"
+      msg_info "Try: pg config --help for more examples"
+    fi
+  fi
 }
 
 cmd_config_diff()
@@ -1960,7 +2105,17 @@ cmd_watch()
 cmd_explain()
 {
   local sql="$*"
-  [ -z "$sql" ] && { echo "Usage: $EXEC_NAME explain \"<SQL>\""; return 1; }
+  local analyze_mode=false
+
+  # Check if first argument is 'analyze' keyword (case-insensitive)
+  local first_arg_lower=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+  if [ "$first_arg_lower" = "analyze" ]; then
+    analyze_mode=true
+    shift
+    sql="$*"
+  fi
+
+  [ -z "$sql" ] && { echo "Usage: $EXEC_NAME explain [analyze] \"<SQL>\""; return 1; }
 
   # Basic SQL validation to prevent harmful statements
   local sql_upper=$(echo "$sql" | tr '[:lower:]' '[:upper:]')
@@ -1969,9 +2124,25 @@ cmd_explain()
     return 1
   fi
 
-  # Sanitize the input before passing to EXPLAIN
-  local sanitized_sql=$(q_sanitize "$sql")
-  q "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) $sanitized_sql;"
+  # Validate SQL contains only safe characters for SELECT statements
+  if [[ ! "$sql" =~ ^[[:space:]]*[Ss][Ee][Ll][Ee][Cc][Tt] ]]; then
+    echo "Error: Only SELECT statements are allowed" >&2
+    return 1
+  fi
+
+  # Do NOT use q_sanitize on full SQL - it corrupts SQL syntax (= becomes _)
+  # The SQL is passed directly as it has been validated above
+  if [ "$analyze_mode" = true ]; then
+    echo "=== EXECUTION PLAN ==="
+    echo ""
+    q "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) $sql;"
+    echo ""
+    echo "=== EXECUTION RESULT ==="
+    echo ""
+    q "$sql;"
+  else
+    q "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) $sql;"
+  fi
 }
 
 cmd_explain_json()
@@ -1986,9 +2157,15 @@ cmd_explain_json()
     return 1
   fi
 
-  # Sanitize the input before passing to EXPLAIN
-  local sanitized_sql=$(q_sanitize "$sql")
-  q "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) $sanitized_sql;"
+  # Validate SQL contains only safe characters for SELECT statements
+  if [[ ! "$sql" =~ ^[[:space:]]*[Ss][Ee][Ll][Ee][Cc][Tt] ]]; then
+    echo "Error: Only SELECT statements are allowed" >&2
+    return 1
+  fi
+
+  # Do NOT use q_sanitize on full SQL - it corrupts SQL syntax (= becomes _)
+  # The SQL is passed directly as it has been validated above
+  q "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) $sql;"
 }
 
 cmd_lock_tree()
@@ -2451,8 +2628,6 @@ cmd_lock_graph()
      ORDER BY chain_root, level, blocked_duration DESC;"
 }
 
-cmd_bloat_detail() { cmd_bloat "$@" ; }
-
 cmd_stats_check()
 {
   q "SELECT schemaname, relname AS tablename,
@@ -2655,33 +2830,8 @@ cmd_user_access_pattern()
 # ENTERPRISE-LEVEL FEATURES
 # ============================================
 
-# Enterprise Monitoring Dashboard
-cmd_enterprise_monitor()
-{
-  colorize blue "=== ENTERPRISE MONITORING DASHBOARD ==="
-  echo ""
-
-  # Key business metrics
-  colorize yellow "BUSINESS METRICS:"
-  cmd_conn 2>&1 | head -5
-  echo ""
-
-  colorize yellow "PERFORMANCE METRICS:"
-  cmd_cache_hit 2>&1 | head -5
-  echo ""
-
-  colorize yellow "STORAGE METRICS:"
-  cmd_db_size 2>&1 | head -5
-  echo ""
-
-  colorize yellow "TRANSACTION METRICS:"
-  cmd_active_transactions 5 2>&1
-  echo ""
-
-  # Alert status
-  colorize yellow "ALERT STATUS:"
-  cmd_alert_status 2>&1
-}
+# Enterprise Monitoring Dashboard (deprecated - use diagnose health)
+cmd_enterprise_monitor() { cmd_diagnose_health; }
 
 # SLA Tracker
 cmd_sla_tracker()
@@ -2950,173 +3100,11 @@ cmd_compliance_check()
 # PRODUCTION PROBLEM DIAGNOSIS COMMANDS
 # ============================================
 
-cmd_quick_diagnosis()
-{
-  colorize blue "=== QUICK PRODUCTION DIAGNOSIS ==="
-  echo ""
+cmd_quick_diagnosis() { cmd_diagnose_health; }
 
-  # Check for blocking transactions
-  colorize yellow "BLOCKING TRANSACTIONS:"
-  cmd_blocking 2>&1 || echo "No blocking transactions found"
-  echo ""
+cmd_problem_summary() { cmd_diagnose_health; }
 
-  # Check for long running queries
-  colorize yellow "LONG RUNNING QUERIES (5+ seconds):"
-  cmd_slow 5 2>&1 | head -10 || echo "No long running queries found"
-  echo ""
-
-  # Check connection status
-  colorize yellow "CONNECTION STATUS:"
-  cmd_conn 2>&1 || echo "Error getting connection status"
-  echo ""
-
-  # Check for idle in transaction
-  colorize yellow "IDLE IN TRANSACTION SESSIONS:"
-  cmd_idle_tx 2>&1 || echo "No idle transactions found"
-  echo ""
-
-  # Check cache hit ratio
-  colorize yellow "CACHE HIT RATIO:"
-  cmd_cache_hit 2>&1 | head -10 || echo "Error getting cache hit ratio"
-  echo ""
-
-  # Check for unused indexes
-  colorize yellow "UNUSED INDEXES:"
-  cmd_unused_indexes 2>&1 | head -5 || echo "No unused indexes found"
-  echo ""
-
-  # Check for dead tuples
-  colorize yellow "DEAD TUPLES (Top 10):"
-  cmd_dead_tuples 10 2>&1 || echo "Error getting dead tuples"
-  echo ""
-
-  # Check replication lag if applicable
-  colorize yellow "REPLICATION LAG:"
-  cmd_repl_lag 2>&1 || echo "Replication not configured or error getting status"
-  echo ""
-}
-
-cmd_problem_summary()
-{
-  colorize blue "=== PROBLEM SUMMARY REPORT ==="
-  echo ""
-
-  # System health summary
-  echo "System Health:"
-  cmd_health 2>&1
-  echo ""
-
-  # Top resource consumers
-  colorize yellow "TOP TIME CONSUMING QUERIES (last 24h):"
-  cmd_top_time 5 2>&1
-  echo ""
-
-  # Current activity
-  colorize yellow "CURRENT ACTIVITY:"
-  cmd_activity 2>&1 | head -20
-  echo ""
-
-  # Problems identified
-  colorize red "POTENTIAL ISSUES:"
-  local issues=0
-
-  # Check for blocking
-  local blocking_count=$(cmd_blocking 2>&1 | wc -l)
-  if [[ "$blocking_count" =~ ^[0-9]+$ ]]; then
-    if [ "$blocking_count" -gt 3 ]; then  # Account for header lines
-      echo "- Blocking transactions detected ($((blocking_count-3)) sessions)"
-      issues=$((issues+1))
-    fi
-  else
-    echo "- Error determining blocking session count (received: $blocking_count)"
-    issues=$((issues+1))
-  fi
-
-  # Check for long transactions
-  local long_tx_count=$(cmd_long_transactions 10 2>&1 | wc -l)
-  if [[ "$long_tx_count" =~ ^[0-9]+$ ]]; then
-    if [ "$long_tx_count" -gt 1 ]; then
-      echo "- Long running transactions detected ($((long_tx_count-1)) sessions > 10 mins)"
-      issues=$((issues+1))
-    fi
-  else
-    echo "- Error determining long transaction count (received: $long_tx_count)"
-    issues=$((issues+1))
-  fi
-
-  # Check for idle in transaction
-  local idle_tx_count=$(cmd_idle_tx 2>&1 | wc -l)
-  if [[ "$idle_tx_count" =~ ^[0-9]+$ ]]; then
-    if [ "$idle_tx_count" -gt 1 ]; then
-      echo "- Sessions idle in transaction detected ($((idle_tx_count-1)) sessions)"
-      issues=$((issues+1))
-    fi
-  else
-    echo "- Error determining idle in transaction count (received: $idle_tx_count)"
-    issues=$((issues+1))
-  fi
-
-  # Check for high connection usage
-  local conn_details=$(cmd_conn_limit 2>&1)
-  local current_conns=$(echo "$conn_details" | grep "current_connections" | awk '{print $2}')
-  local max_conns=$(echo "$conn_details" | grep "max_connections" | awk '{print $2}')
-  if [[ "$current_conns" =~ ^[0-9]+$ ]] && [[ "$max_conns" =~ ^[0-9]+$ ]] && [ "$max_conns" -gt 0 ]; then
-    local usage_percent=$((current_conns * 100 / max_conns))
-
-    if [ "$usage_percent" -gt 80 ]; then
-      echo "- High connection usage: ${usage_percent}% ($current_conns/$max_conns)"
-      issues=$((issues+1))
-    fi
-  else
-    echo "- Error determining connection usage (invalid data received)"
-    issues=$((issues+1))
-  fi
-
-  if [ "$issues" -eq 0 ]; then
-    colorize green "No immediate issues detected"
-  fi
-  echo ""
-
-  # Resource utilization
-  colorize yellow "RESOURCE UTILIZATION:"
-  cmd_cache_hit 2>&1 | head -10
-  echo ""
-  cmd_io_stats 2>&1 | head -10
-  echo ""
-  cmd_temp_files 2>&1 | head -10
-  echo ""
-}
-
-cmd_performance_insights()
-{
-  colorize blue "=== PERFORMANCE INSIGHTS ==="
-  echo ""
-
-  # Top IO queries
-  colorize yellow "TOP IO CONSUMING QUERIES:"
-  cmd_top_io 5 2>&1
-  echo ""
-
-  # Tables with high seq scans
-  colorize yellow "TABLES WITH HIGH SEQUENTIAL SCANS:"
-  cmd_seq_scans 10 2>&1
-  echo ""
-
-  # Missing indexes
-  colorize yellow "MISSING INDEXES SUGGESTION:"
-  cmd_missing_indexes 10 2>&1
-  echo ""
-
-  # Wait events
-  colorize yellow "WAIT EVENTS:"
-  cmd_wait_events 2>&1 | head -10
-  echo ""
-
-  # Table bloat analysis
-  colorize yellow "TABLE BLOAT ANALYSIS (Top 10):"
-  cmd_bloat_analysis 10 2>&1
-  echo ""
-}
+cmd_performance_insights() { cmd_diagnose_performance; }
 
 cmd_emergency_stop()
 {
@@ -3147,407 +3135,6 @@ cmd_emergency_stop()
   echo ""
 }
 
-cmd_alert_status()
-{
-  colorize blue "=== ALERT STATUS CHECK ==="
-  echo ""
-
-  # Check connection limits
-  colorize yellow "CONNECTION LIMIT STATUS:"
-  local conn_details=$(cmd_conn_limit 2>&1)
-  echo "$conn_details"
-
-  local current_conns=$(echo "$conn_details" | grep "current_connections" | awk '{print $2}')
-  local max_conns=$(echo "$conn_details" | grep "max_connections" | awk '{print $2}')
-  if [[ "$current_conns" =~ ^[0-9]+$ ]] && [[ "$max_conns" =~ ^[0-9]+$ ]] && [ "$max_conns" -gt 0 ]; then
-    local usage_percent=$((current_conns * 100 / max_conns))
-
-    if [ "$usage_percent" -gt 90 ]; then
-      colorize red "CRITICAL: Connection usage at ${usage_percent}%"
-    elif [ "$usage_percent" -gt 75 ]; then
-      colorize yellow "WARNING: Connection usage at ${usage_percent}%"
-    else
-      colorize green "OK: Connection usage at ${usage_percent}%"
-    fi
-  else
-    colorize yellow "WARNING: Unable to determine connection usage (invalid data received)"
-  fi
-  echo ""
-
-  # Check for blocking sessions
-  colorize yellow "BLOCKING SESSION STATUS:"
-  local blocking_count=$(cmd_blocking 2>&1 | wc -l)
-  if [[ "$blocking_count" =~ ^[0-9]+$ ]]; then
-    local actual_blocking=$((blocking_count-3))  # Account for header lines
-    if [ "$actual_blocking" -gt 5 ]; then
-      colorize red "CRITICAL: $actual_blocking blocking sessions detected"
-    elif [ "$actual_blocking" -gt 0 ]; then
-      colorize yellow "WARNING: $actual_blocking blocking sessions detected"
-    else
-      colorize green "OK: No blocking sessions detected"
-    fi
-  else
-    colorize yellow "WARNING: Unable to determine blocking session count (invalid data received)"
-  fi
-  echo ""
-
-  # Check for idle in transaction
-  colorize yellow "IDLE IN TRANSACTION STATUS:"
-  local idle_tx_count=$(cmd_idle_tx 2>&1 | wc -l)
-  if [[ "$idle_tx_count" =~ ^[0-9]+$ ]]; then
-    local actual_idle=$((idle_tx_count-1))  # Account for header lines
-    if [ "$actual_idle" -gt 10 ]; then
-      colorize red "CRITICAL: $actual_idle idle in transaction sessions detected"
-    elif [ "$actual_idle" -gt 0 ]; then
-      colorize yellow "WARNING: $actual_idle idle in transaction sessions detected"
-    else
-      colorize green "OK: No idle in transaction sessions detected"
-    fi
-  else
-    colorize yellow "WARNING: Unable to determine idle in transaction count (invalid data received)"
-  fi
-  echo ""
-
-  # Check for long transactions
-  colorize yellow "LONG TRANSACTION STATUS:"
-  local long_tx_count=$(cmd_long_transactions 30 2>&1 | wc -l)
-  if [[ "$long_tx_count" =~ ^[0-9]+$ ]]; then
-    local actual_long_tx=$((long_tx_count-1))  # Account for header lines
-    if [ "$actual_long_tx" -gt 5 ]; then
-      colorize red "CRITICAL: $actual_long_tx long running transactions (>30 mins) detected"
-    elif [ "$actual_long_tx" -gt 0 ]; then
-      colorize yellow "WARNING: $actual_long_tx long running transactions (>30 mins) detected"
-    else
-      colorize green "OK: No long running transactions detected"
-    fi
-  else
-    colorize yellow "WARNING: Unable to determine long transaction count (invalid data received)"
-  fi
-  echo ""
-
-  # Check cache hit ratio
-  colorize yellow "CACHE HIT RATIO:"
-  local cache_hit_line=$(cmd_cache_hit 2>&1 | grep -v "level\|Database" | head -1)
-  local cache_ratio=$(echo "$cache_hit_line" | awk '{print $NF}')
-  if [[ "$cache_ratio" =~ ^[0-9]+\.?[0-9]*$ ]] && (( $(echo "$cache_ratio < 85" | bc -l) )); then
-    colorize red "CRITICAL: Low cache hit ratio: ${cache_ratio}%"
-  elif [[ "$cache_ratio" =~ ^[0-9]+\.?[0-9]*$ ]] && (( $(echo "$cache_ratio < 95" | bc -l) )); then
-    colorize yellow "WARNING: Moderate cache hit ratio: ${cache_ratio}%"
-  else
-    colorize green "OK: Good cache hit ratio: ${cache_ratio}%"
-  fi
-  echo ""
-}
-
-# ============================================
-# COMBINED DIAGNOSIS COMMANDS
-# ============================================
-
-cmd_diagnose_slow_query()
-{
-  local pid="$1"
-  local threshold="${2:-5}"
-
-  echo "╔════════════════════════════════════════════════════════════════╗"
-  echo "║              SLOW QUERY DIAGNOSIS REPORT                        ║"
-  echo "╚════════════════════════════════════════════════════════════════╝"
-  echo ""
-  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
-  echo ""
-
-  # Section 1: 当前慢查询列表
-  colorize yellow "═══ SECTION 1: CURRENT SLOW QUERIES ═══"
-  echo ""
-  cmd_slow_enhanced "$pid" "$threshold"
-  echo ""
-
-  # Section 2: 历史TOP查询
-  colorize yellow "═══ SECTION 2: HISTORICAL TOP QUERIES ═══"
-  echo ""
-  if require_extension pg_stat_statements; then
-    cmd_top_time 5
-    echo ""
-    cmd_top_io 5
-  fi
-  echo ""
-
-  # Section 3: 系统状态
-  colorize yellow "═══ SECTION 3: SYSTEM STATE ═══"
-  echo ""
-  cmd_cache_hit
-  echo ""
-  cmd_wait_events
-  echo ""
-
-  # Section 4: 总结和建议
-  colorize yellow "═══ SECTION 4: SUMMARY AND RECOMMENDATIONS ═══"
-  echo ""
-  echo "Key findings:"
-  echo "  - Run 'pg slow_enhanced <PID>' for detailed query analysis"
-  echo "  - Check if indexes are properly configured (pg missing_indexes)"
-  echo "  - Verify statistics are up to date (pg vacuum_status)"
-  echo "  - Monitor for patterns in query execution times"
-  echo ""
-
-  colorize green "Diagnosis complete. Use specific commands for deeper analysis."
-}
-
-cmd_diagnose_lock_issue()
-{
-  echo "╔════════════════════════════════════════════════════════════════╗"
-  echo "║              LOCK ISSUE DIAGNOSIS REPORT                        ║"
-  echo "╚════════════════════════════════════════════════════════════════╝"
-  echo ""
-  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo ""
-
-  # Section 1: 阻塞链分析
-  colorize yellow "═══ SECTION 1: BLOCKING CHAIN ANALYSIS ═══"
-  echo ""
-  cmd_blocking_enhanced
-  echo ""
-
-  # Section 2: 锁详情
-  colorize yellow "═══ SECTION 2: CURRENT LOCKS ═══"
-  echo ""
-  cmd_locks
-  echo ""
-
-  # Section 3: 相关事务
-  colorize yellow "═══ SECTION 3: IDLE IN TRANSACTION ═══"
-  echo ""
-  cmd_idle_tx
-  echo ""
-
-  colorize yellow "═══ SECTION 4: LONG TRANSACTIONS ═══"
-  echo ""
-  cmd_long_transactions 10
-  echo ""
-
-  # Section 5: 总结
-  colorize yellow "═══ SECTION 5: RESOLUTION STEPS ═══"
-  echo ""
-  echo "1. Identify root blocker from Section 1"
-  echo "2. Try: pg cancel <root_pid>"
-  echo "3. If needed: pg kill <root_pid>"
-  echo "4. For prevention:"
-  echo "   - Set idle_in_transaction_session_timeout"
-  echo "   - Schedule DDL during maintenance windows"
-  echo "   - Monitor long-running transactions"
-  echo ""
-
-  colorize green "Lock diagnosis complete."
-}
-
-cmd_diagnose_connection()
-{
-  echo "╔════════════════════════════════════════════════════════════════╗"
-  echo "║           CONNECTION POOL DIAGNOSIS REPORT                      ║"
-  echo "╚════════════════════════════════════════════════════════════════╝"
-  echo ""
-  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo ""
-
-  # Section 1: 连接概览
-  colorize yellow "═══ SECTION 1: CONNECTION OVERVIEW ═══"
-  echo ""
-  cmd_conn
-  echo ""
-
-  # Section 2: 连接限制
-  colorize yellow "═══ SECTION 2: CONNECTION LIMITS ═══"
-  echo ""
-  cmd_conn_limit
-  echo ""
-
-  # Section 3: 连接来源分析
-  colorize yellow "═══ SECTION 3: CONNECTION SOURCES ═══"
-  echo ""
-  q "SELECT
-    application_name,
-    client_addr::text,
-    usename,
-    state,
-    count(*) as conn_count
-  FROM pg_stat_activity
-  GROUP BY application_name, client_addr, usename, state
-  ORDER BY count(*) DESC
-  LIMIT 15;"
-  echo ""
-
-  # Section 4: 问题连接
-  colorize yellow "═══ SECTION 4: PROBLEMATIC CONNECTIONS ═══"
-  echo ""
-  colorize blue "Idle in transaction (>5 min):"
-  cmd_idle_tx
-  echo ""
-  colorize blue "Long idle connections (>1 hour):"
-  q "SELECT pid, usename, application_name,
-    round(EXTRACT(EPOCH FROM (now() - query_start))/60) as idle_minutes,
-    client_addr::text
-  FROM pg_stat_activity
-  WHERE state = 'idle'
-    AND query_start < now() - interval '1 hour'
-  ORDER BY idle_minutes DESC
-  LIMIT 10;"
-  echo ""
-
-  # Section 5: 建议
-  colorize yellow "═══ SECTION 5: RECOMMENDATIONS ═══"
-  echo ""
-  echo "Connection Pool Configuration:"
-  local max_conn current_conn
-  max_conn=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo 100)
-  current_conn=$(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo 0)
-
-  # Validate numeric values before arithmetic
-  if [[ "$max_conn" =~ ^[0-9]+$ ]] && [[ "$current_conn" =~ ^[0-9]+$ ]] && [ "$max_conn" -gt 0 ]; then
-    echo "  max_connections: $max_conn"
-    echo "  current connections: $current_conn"
-    echo "  Utilization: $(( current_conn * 100 / max_conn ))%"
-    echo ""
-    echo "  Recommended pool size (per pgbouncer):"
-    echo "    - Session pool: $(( max_conn / 2 )) - $(( max_conn * 3 / 4 ))"
-    echo "    - Transaction pool: $(( max_conn / 4 )) - $(( max_conn / 2 ))"
-  else
-    echo "  Unable to calculate pool recommendations (connection error?)"
-  fi
-  echo ""
-
-  colorize green "Connection diagnosis complete."
-}
-
-cmd_diagnose_replication()
-{
-  echo "╔════════════════════════════════════════════════════════════════╗"
-  echo "║            REPLICATION DIAGNOSIS REPORT                         ║"
-  echo "╚════════════════════════════════════════════════════════════════╝"
-  echo ""
-  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo ""
-
-  # Section 1: 复制状态
-  colorize yellow "═══ SECTION 1: REPLICATION STATUS ═══"
-  echo ""
-  cmd_repl
-  echo ""
-
-  # Section 2: 复制延迟
-  colorize yellow "═══ SECTION 2: REPLICATION LAG ═══"
-  echo ""
-  cmd_repl_lag
-  echo ""
-
-  # Section 3: 复制槽
-  colorize yellow "═══ SECTION 3: REPLICATION SLOTS ═══"
-  echo ""
-  cmd_slot
-  echo ""
-  cmd_slot_usage
-  echo ""
-
-  # Section 4: 延迟分析
-  colorize yellow "═══ SECTION 4: LAG ANALYSIS ═══"
-  echo ""
-
-  if [ "$HAS_REPLICATION_SLOTS" = "true" ]; then
-    q "SELECT
-      client_addr,
-      state,
-      sync_state,
-      round(EXTRACT(EPOCH FROM write_lag)) as write_lag_sec,
-      round(EXTRACT(EPOCH FROM flush_lag)) as flush_lag_sec,
-      round(EXTRACT(EPOCH FROM replay_lag)) as replay_lag_sec,
-      CASE
-        WHEN replay_lag > interval '1 hour' THEN 'CRITICAL: Very high lag'
-        WHEN replay_lag > interval '5 minutes' THEN 'WARNING: High lag'
-        ELSE 'OK'
-      END as status
-    FROM pg_stat_replication;" 2>/dev/null || msg_info "No replication configured or no access"
-  else
-    msg_info "Replication lag analysis requires PostgreSQL 10+"
-  fi
-  echo ""
-
-  # Section 5: 建议
-  colorize yellow "═══ SECTION 5: RECOMMENDATIONS ═══"
-  echo ""
-  echo "Monitoring:"
-  echo "  - Monitor replication lag regularly"
-  echo "  - Set up alerts for lag > 5 minutes"
-  echo "  - Check WAL disk space on standby"
-  echo ""
-  echo "Troubleshooting:"
-  echo "  - High write_lag: Network issue"
-  echo "  - High flush_lag: Standby disk I/O issue"
-  echo "  - High replay_lag: Standby CPU/load issue"
-  echo ""
-
-  colorize green "Replication diagnosis complete."
-}
-
-cmd_diagnose_performance()
-{
-  echo "╔════════════════════════════════════════════════════════════════╗"
-  echo "║           PERFORMANCE DIAGNOSIS REPORT                          ║"
-  echo "╚════════════════════════════════════════════════════════════════╝"
-  echo ""
-  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
-  echo ""
-
-  # Section 1: 快速健康检查
-  colorize yellow "═══ SECTION 1: HEALTH CHECK ═══"
-  echo ""
-  cmd_health
-  echo ""
-
-  # Section 2: 缓存效率
-  colorize yellow "═══ SECTION 2: CACHE EFFICIENCY ═══"
-  echo ""
-  cmd_cache_hit
-  echo ""
-
-  # Section 3: I/O 统计
-  colorize yellow "═══ SECTION 3: I/O STATISTICS ═══"
-  echo ""
-  cmd_io_stats
-  echo ""
-
-  # Section 4: 等待事件
-  colorize yellow "═══ SECTION 4: WAIT EVENTS ═══"
-  echo ""
-  cmd_wait_events
-  echo ""
-
-  # Section 5: TOP 查询
-  colorize yellow "═══ SECTION 5: TOP QUERIES BY TIME ═══"
-  echo ""
-  if require_extension pg_stat_statements; then
-    cmd_top_time 10
-    echo ""
-    colorize yellow "═══ SECTION 6: TOP QUERIES BY I/O ═══"
-    echo ""
-    cmd_top_io 10
-  fi
-  echo ""
-
-  # Section 7: 建议
-  colorize yellow "═══ SUMMARY: PERFORMANCE INSIGHTS ═══"
-  echo ""
-  echo "Check items:"
-  echo "  1. Cache hit ratio should be > 95%"
-  echo "  2. Top queries should not dominate total time"
-  echo "  3. Wait events should not show sustained IO/Lock waits"
-  echo ""
-  echo "Actions:"
-  echo "  - Run 'pg diagnose slow_query' for query analysis"
-  echo "  - Run 'pg diagnose lock_issue' if locks are problematic"
-  echo "  - Check 'pg missing_indexes' for index suggestions"
-  echo ""
-
-  colorize green "Performance diagnosis complete."
-}
 
 cmd_diagnose_health()
 {
@@ -3801,6 +3388,1417 @@ cmd_diagnose_capacity()
   colorize green "Capacity analysis complete."
 }
 
+# ============================================
+# WORKFLOW - INTELLIGENT DIAGNOSIS WORKFLOW
+# ============================================
+
+cmd_workflow()
+{
+  local action="${1:-auto}"
+  shift || true
+
+  case "$action" in
+    auto|detect|scan)    workflow_auto_detect "$@" ;;
+    slow|slow_query)     workflow_slow_query "$@" ;;
+    lock|blocking)       workflow_lock_issue "$@" ;;
+    conn|connection)     workflow_connection "$@" ;;
+    io|performance)      workflow_io_performance "$@" ;;
+    full|complete)       workflow_full_diagnosis "$@" ;;
+    *)
+      echo "Usage: $EXEC_NAME workflow <action> [options]"
+      echo ""
+      echo "Actions:"
+      echo "  auto              Auto-detect database issues (default)"
+      echo "  slow_query [pid]  Deep diagnosis for slow query issues"
+      echo "  lock              Diagnose lock and blocking issues"
+      echo "  connection        Diagnose connection pool issues"
+      echo "  io                Diagnose I/O performance issues"
+      echo "  full              Complete comprehensive diagnosis"
+      echo ""
+      echo "Examples:"
+      echo "  $EXEC_NAME workflow auto"
+      echo "  $EXEC_NAME workflow slow_query"
+      echo "  $EXEC_NAME workflow lock"
+      echo "  $EXEC_NAME workflow full"
+      ;;
+  esac
+}
+
+# Print workflow step header
+workflow_step()
+{
+  local step_num="$1"
+  local total="$2"
+  local title="$3"
+  echo ""
+  colorize yellow "📊 Step $step_num/$total: $title"
+  echo ""
+}
+
+# Print workflow result
+workflow_result()
+{
+  local status="$1"
+  local message="$2"
+  case "$status" in
+    ok|good|green)
+      echo "   ✅ $message"
+      ;;
+    warn|warning|yellow)
+      echo "   ⚠️  $message"
+      ;;
+    critical|error|red)
+      echo "   ❌ $message"
+      ;;
+    info|blue)
+      echo "   ℹ️  $message"
+      ;;
+  esac
+}
+
+# ============================================
+# AUTO DETECT - Automatic issue detection
+# ============================================
+
+workflow_auto_detect()
+{
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔍 INTELLIGENT DATABASE DIAGNOSIS                      ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Started at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
+  echo "PostgreSQL: $(q_scalar "SELECT version();" 2>/dev/null | head -1)"
+  echo ""
+  print_separator 70
+
+  local issues_found=0
+  local warnings_found=0
+  local critical_issues=""
+  local recommendations=""
+
+  # Step 1: Connection Health
+  workflow_step 1 5 "Connection Health Check"
+  local current_conn max_conn conn_pct
+  current_conn=$(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo 0)
+  max_conn=$(q_scalar "SELECT setting::int FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo 100)
+
+  if [[ "$current_conn" =~ ^[0-9]+$ ]] && [[ "$max_conn" =~ ^[0-9]+$ ]] && [ "$max_conn" -gt 0 ]; then
+    conn_pct=$(( current_conn * 100 / max_conn ))
+    echo "   Connections: $current_conn / $max_conn ($(format_percent $conn_pct))"
+
+    if [ "$conn_pct" -gt 90 ]; then
+      workflow_result critical "CRITICAL: Connection usage > 90%"
+      issues_found=$((issues_found + 1))
+      critical_issues="${critical_issues}Connection exhaustion (90%+);"
+      recommendations="${recommendations}Increase max_connections or implement connection pooling;"
+    elif [ "$conn_pct" -gt 75 ]; then
+      workflow_result warning "WARNING: Connection usage > 75%"
+      warnings_found=$((warnings_found + 1))
+    else
+      workflow_result ok "Connection usage healthy"
+    fi
+  fi
+
+  # Check idle in transaction
+  local idle_tx
+  idle_tx=$(q_scalar "SELECT count(*) FROM pg_stat_activity WHERE state = 'idle in transaction';" 2>/dev/null || echo 0)
+  if [[ "$idle_tx" =~ ^[0-9]+$ ]] && [ "$idle_tx" -gt 0 ]; then
+    if [ "$idle_tx" -gt 5 ]; then
+      workflow_result warning "$idle_tx sessions idle in transaction"
+      warnings_found=$((warnings_found + 1))
+      recommendations="${recommendations}Review idle transactions; consider setting idle_in_transaction_session_timeout;"
+    else
+      workflow_result info "$idle_tx sessions idle in transaction"
+    fi
+  fi
+
+  # Step 2: Slow Query Detection
+  workflow_step 2 5 "Slow Query Analysis"
+  local slow_count
+  slow_count=$(q_scalar "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND now() - query_start > interval '5 seconds';" 2>/dev/null || echo 0)
+
+  if [[ "$slow_count" =~ ^[0-9]+$ ]] && [ "$slow_count" -gt 0 ]; then
+    workflow_result warning "Found $slow_count slow queries (running > 5s)"
+    issues_found=$((issues_found + 1))
+    critical_issues="${critical_issues}Slow queries detected;"
+
+    # Get slowest query sample
+    local slow_query
+    slow_query=$(q_scalar "SELECT LEFT(query, 80) FROM pg_stat_activity WHERE state = 'active' AND now() - query_start > interval '5 seconds' ORDER BY now() - query_start DESC LIMIT 1;" 2>/dev/null)
+    if [ -n "$slow_query" ]; then
+      echo "   Slowest: ${slow_query}..."
+    fi
+    recommendations="${recommendations}Run 'pg workflow slow_query' for detailed analysis;"
+  else
+    workflow_result ok "No slow queries detected"
+  fi
+
+  # Step 3: Lock & Blocking Analysis
+  workflow_step 3 5 "Lock & Blocking Check"
+  local blocked_count blocking_count
+  blocked_count=$(q_scalar "SELECT count(*) FROM pg_locks WHERE NOT granted;" 2>/dev/null || echo 0)
+  blocking_count=$(q_scalar "SELECT count(DISTINCT blocking_pid) FROM pg_locks blocked JOIN pg_locks blocking ON blocked.locktype = blocking.locktype AND blocked.relation = blocking.relation WHERE blocked.granted = false AND blocking.granted = true;" 2>/dev/null || echo 0)
+
+  if [[ "$blocked_count" =~ ^[0-9]+$ ]] && [ "$blocked_count" -gt 0 ]; then
+    workflow_result critical "CRITICAL: $blocked_count blocked sessions"
+    issues_found=$((issues_found + 1))
+    critical_issues="${critical_issues}Lock blocking issues;"
+    recommendations="${recommendations}Run 'pg workflow lock' for lock analysis; consider terminating blocking sessions;"
+  elif [[ "$blocking_count" =~ ^[0-9]+$ ]] && [ "$blocking_count" -gt 0 ]; then
+    workflow_result warning "$blocking_count blocking sessions"
+    warnings_found=$((warnings_found + 1))
+  else
+    workflow_result ok "No blocking issues"
+  fi
+
+  # Step 4: Cache & I/O Health
+  workflow_step 4 5 "Cache & I/O Health"
+  local cache_ratio
+  cache_ratio=$(q_scalar "SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 2) FROM pg_stat_database WHERE datname not in ('template0', 'template1');" 2>/dev/null)
+
+  if [ -n "$cache_ratio" ] && [[ "$cache_ratio" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+    echo "   Cache hit ratio: $(format_percent $cache_ratio)"
+
+    if (( $(echo "$cache_ratio < 85" | bc -l) )); then
+      workflow_result critical "CRITICAL: Cache hit ratio < 85%"
+      issues_found=$((issues_found + 1))
+      critical_issues="${critical_issues}Low cache hit ratio;"
+      recommendations="${recommendations}Increase shared_buffers; review queries causing sequential scans;"
+    elif (( $(echo "$cache_ratio < 95" | bc -l) )); then
+      workflow_result warning "Cache hit ratio below optimal (< 95%)"
+      warnings_found=$((warnings_found + 1))
+    else
+      workflow_result ok "Cache hit ratio excellent"
+    fi
+  fi
+
+  # Check wait events
+  if [ "$PG_MAJOR_VERSION" -ge 10 ]; then
+    local io_wait_pct
+    io_wait_pct=$(q_scalar "SELECT round(100.0 * count(*) / nullif((SELECT count(*) FROM pg_stat_activity WHERE state = 'active'), 0), 1) FROM pg_stat_activity WHERE wait_event_type = 'IO';" 2>/dev/null || echo 0)
+
+    if [[ "$io_wait_pct" =~ ^[0-9]+\.?[0-9]*$ ]] && (( $(echo "$io_wait_pct > 30" | bc -l) )); then
+      workflow_result warning "High I/O wait: ${io_wait_pct}%"
+      warnings_found=$((warnings_found + 1))
+      recommendations="${recommendations}Review I/O performance; consider faster storage or query optimization;"
+    fi
+  fi
+
+  # Step 5: Table Health
+  workflow_step 5 5 "Table Health Check"
+  local bloated_tables vacuum_needed
+  bloated_tables=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables WHERE n_dead_tup > 10000;" 2>/dev/null || echo 0)
+  vacuum_needed=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables WHERE n_dead_tup > 1000 AND (last_vacuum IS NULL AND last_autovacuum IS NULL);" 2>/dev/null || echo 0)
+
+  if [[ "$bloated_tables" =~ ^[0-9]+$ ]] && [ "$bloated_tables" -gt 0 ]; then
+    if [ "$bloated_tables" -gt 10 ]; then
+      workflow_result warning "$bloated_tables tables need vacuum (high dead tuples)"
+      warnings_found=$((warnings_found + 1))
+      recommendations="${recommendations}Run VACUUM on tables with high dead tuples;"
+    else
+      workflow_result info "$bloated_tables tables with dead tuples"
+    fi
+  fi
+
+  if [[ "$vacuum_needed" =~ ^[0-9]+$ ]] && [ "$vacuum_needed" -gt 0 ]; then
+    workflow_result warning "$vacuum_needed tables never vacuumed"
+    recommendations="${recommendations}Ensure autovacuum is enabled; manually vacuum stale tables;"
+  fi
+
+  # Summary
+  echo ""
+  print_separator 70
+  echo ""
+  colorize yellow "📋 DIAGNOSIS SUMMARY"
+  echo ""
+
+  if [ $issues_found -eq 0 ] && [ $warnings_found -eq 0 ]; then
+    colorize green "   ✅ Database health: EXCELLENT"
+    echo "   No issues detected. Database is running optimally."
+  elif [ $issues_found -eq 0 ]; then
+    colorize yellow "   ⚠️  Database health: GOOD (with warnings)"
+    echo "   Warnings found: $warnings_found"
+  else
+    colorize red "   ❌ Database health: NEEDS ATTENTION"
+    echo "   Critical issues: $issues_found"
+    echo "   Warnings: $warnings_found"
+  fi
+
+  echo ""
+
+  # Show critical issues
+  if [ -n "$critical_issues" ]; then
+    colorize red "🚨 Critical Issues Detected:"
+    echo "$critical_issues" | tr ';' '\n' | while read -r issue; do
+      [ -n "$issue" ] && echo "   • $issue"
+    done
+    echo ""
+  fi
+
+  # Show recommendations
+  if [ -n "$recommendations" ]; then
+    colorize yellow "💡 Recommended Actions:"
+    echo "$recommendations" | tr ';' '\n' | while read -r rec; do
+      [ -n "$rec" ] && echo "   • $rec"
+    done
+    echo ""
+  fi
+
+  # Quick action suggestions
+  echo ""
+  colorize blue "🔧 Quick Actions:"
+  echo "   • pg workflow slow_query  - Deep dive into slow queries"
+  echo "   • pg workflow lock        - Analyze lock issues"
+  echo "   • pg workflow connection  - Check connection details"
+  echo "   • pg blocking             - See blocking sessions"
+  echo "   • pg tune score           - Get configuration score"
+  echo ""
+
+  print_separator 70
+  echo ""
+}
+
+# ============================================
+# SLOW QUERY WORKFLOW
+# ============================================
+
+workflow_slow_query()
+{
+  local target_pid="$1"
+
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🐌 SLOW QUERY DIAGNOSIS WORKFLOW                       ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  # Step 1: Check pg_stat_statements
+  workflow_step 1 4 "pg_stat_statements Analysis"
+
+  local has_pgss
+  has_pgss=$(q_scalar "SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements';" 2>/dev/null)
+
+  if [ "$has_pgss" = "1" ]; then
+    workflow_result ok "pg_stat_statements extension is active"
+    echo ""
+    echo "   Top 5 slowest queries by total time:"
+    q "SELECT
+      LEFT(query, 60) as query_preview,
+      calls,
+      round(${PGS_TOTAL_COL:-total_exec_time}::numeric, 2) as total_ms,
+      round(mean_exec_time::numeric, 2) as avg_ms,
+      round((100.0 * ${PGS_TOTAL_COL:-total_exec_time} / (SELECT sum(${PGS_TOTAL_COL:-total_exec_time}) FROM pg_stat_statements))::numeric, 2) as pct_time
+    FROM pg_stat_statements
+    WHERE query NOT LIKE '%pg_stat_statements%'
+    ORDER BY ${PGS_TOTAL_COL:-total_exec_time} DESC
+    LIMIT 5;"
+  else
+    workflow_result warning "pg_stat_statements not installed"
+    echo "   Consider installing: CREATE EXTENSION pg_stat_statements;"
+  fi
+
+  # Step 2: Current slow queries
+  workflow_step 2 4 "Current Slow Queries"
+
+  if [ -n "$target_pid" ]; then
+    echo "   Analyzing specific PID: $target_pid"
+    q "SELECT
+      pid,
+      now() - query_start as duration,
+      state,
+      wait_event_type,
+      wait_event,
+      LEFT(query, 100) as query_preview
+    FROM pg_stat_activity
+    WHERE pid = $target_pid;"
+  else
+    echo "   Active queries running > 3 seconds:"
+    q "SELECT
+      pid,
+      usename,
+      application_name,
+      now() - query_start as duration,
+      wait_event_type,
+      wait_event,
+      LEFT(query, 80) as query_preview
+    FROM pg_stat_activity
+    WHERE state = 'active'
+      AND now() - query_start > interval '3 seconds'
+    ORDER BY query_start;"
+  fi
+
+  # Step 3: Index recommendations
+  workflow_step 3 4 "Index Recommendations"
+
+  echo "   Tables with high sequential scans / index scans ratio:"
+  q "SELECT
+    schemaname || '.' || relname as table_name,
+    seq_scan,
+    idx_scan,
+    CASE WHEN idx_scan > 0 THEN round((100.0 * seq_scan / (seq_scan + idx_scan))::numeric, 2)
+         ELSE 100.0 END as seq_scan_pct,
+    n_live_tup as rows
+  FROM pg_stat_user_tables
+  WHERE seq_scan > 100
+    AND (idx_scan IS NULL OR seq_scan > idx_scan * 2)
+  ORDER BY seq_scan DESC
+  LIMIT 10;"
+
+  workflow_result info "Consider adding indexes to tables with high seq_scan%"
+
+  # Step 4: Query plan analysis suggestion
+  workflow_step 4 4 "Query Plan Analysis"
+
+  if [ -n "$target_pid" ]; then
+    local slow_sql
+    slow_sql=$(q_scalar "SELECT query FROM pg_stat_activity WHERE pid = $target_pid;" 2>/dev/null)
+    if [ -n "$slow_sql" ]; then
+      echo "   SQL for PID $target_pid:"
+      echo "   ${slow_sql:0:200}"
+      echo ""
+      workflow_result info "Analyze with: pg explain \"${slow_sql:0:100}...\""
+    fi
+  fi
+
+  echo ""
+  colorize yellow "💡 Recommendations:"
+  echo "   1. Review queries with high total_time in pg_stat_statements"
+  echo "   2. Add indexes for frequently scanned tables"
+  echo "   3. Use EXPLAIN ANALYZE to understand query plans"
+  echo "   4. Consider query rewriting for complex queries"
+  echo ""
+}
+
+# ============================================
+# LOCK ISSUE WORKFLOW
+# ============================================
+
+workflow_lock_issue()
+{
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔒 LOCK ISSUE DIAGNOSIS WORKFLOW                       ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  # Step 1: Current lock conflicts
+  workflow_step 1 3 "Current Lock Conflicts"
+
+  local blocked_count
+  blocked_count=$(q_scalar "SELECT count(*) FROM pg_locks WHERE NOT granted;" 2>/dev/null || echo 0)
+
+  if [[ "$blocked_count" =~ ^[0-9]+$ ]] && [ "$blocked_count" -gt 0 ]; then
+    workflow_result critical "$blocked_count sessions are blocked"
+    echo ""
+    echo "   Blocking details:"
+    q "SELECT
+      blocked_locks.pid AS blocked_pid,
+      blocked_activity.usename AS blocked_user,
+      blocking_locks.pid AS blocking_pid,
+      blocking_activity.usename AS blocking_user,
+      blocked_activity.query AS blocked_query,
+      blocking_activity.query AS blocking_query,
+      blocked_locks.mode AS blocked_mode,
+      blocking_locks.mode AS blocking_mode
+    FROM pg_catalog.pg_locks blocked_locks
+    JOIN pg_catalog.pg_stat_activity blocked_activity ON blocked_activity.pid = blocked_locks.pid
+    JOIN pg_catalog.pg_locks blocking_locks ON blocking_locks.locktype = blocked_locks.locktype
+        AND blocking_locks.relation = blocked_locks.relation
+        AND blocking_locks.pid != blocked_locks.pid
+    JOIN pg_catalog.pg_stat_activity blocking_activity ON blocking_activity.pid = blocking_locks.pid
+    WHERE NOT blocked_locks.granted
+      AND blocking_locks.granted;"
+  else
+    workflow_result ok "No blocking locks currently"
+  fi
+
+  # Step 2: Lock wait analysis
+  workflow_step 2 3 "Lock Wait Analysis"
+
+  echo "   Sessions waiting on locks:"
+  q "SELECT
+    pid,
+    usename,
+    application_name,
+    state,
+    wait_event_type,
+    wait_event,
+    now() - state_change as wait_duration,
+    LEFT(query, 60) as query_preview
+  FROM pg_stat_activity
+  WHERE wait_event_type = 'Lock'
+  ORDER BY state_change;"
+
+  # Step 3: Long-running transactions
+  workflow_step 3 3 "Long-Running Transactions"
+
+  echo "   Transactions running > 1 minute:"
+  q "SELECT
+    pid,
+    usename,
+    application_name,
+    xact_start,
+    now() - xact_start as duration,
+    state,
+    LEFT(query, 60) as query_preview
+  FROM pg_stat_activity
+  WHERE xact_start IS NOT NULL
+    AND now() - xact_start > interval '1 minute'
+  ORDER BY xact_start;"
+
+  echo ""
+  colorize yellow "💡 Recommendations:"
+  echo "   1. Consider terminating long-running idle transactions"
+  echo "   2. Review application transaction handling"
+  echo "   3. Set idle_in_transaction_session_timeout appropriately"
+  echo "   4. Investigate frequent lock conflicts in application design"
+  echo ""
+}
+
+# ============================================
+# CONNECTION WORKFLOW
+# ============================================
+
+workflow_connection()
+{
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔌 CONNECTION DIAGNOSIS WORKFLOW                       ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  # Step 1: Connection overview
+  workflow_step 1 3 "Connection Overview"
+
+  echo "   Connection summary:"
+  q "SELECT
+    count(*) as total,
+    count(*) FILTER (WHERE state = 'active') as active,
+    count(*) FILTER (WHERE state = 'idle') as idle,
+    count(*) FILTER (WHERE state = 'idle in transaction') as idle_in_tx,
+    count(*) FILTER (WHERE state = 'idle in transaction (aborted)') as idle_in_tx_abort,
+    count(*) FILTER (WHERE wait_event_type IS NOT NULL) as waiting
+  FROM pg_stat_activity;"
+
+  # Step 2: Connection by application
+  workflow_step 2 3 "Connection by Application"
+
+  echo "   Top connection sources:"
+  q "SELECT
+    COALESCE(application_name, 'unknown') as app,
+    COALESCE(usename, 'unknown') as user,
+    client_addr,
+    count(*) as connections,
+    count(*) FILTER (WHERE state = 'active') as active,
+    count(*) FILTER (WHERE state = 'idle in transaction') as idle_in_tx
+  FROM pg_stat_activity
+  GROUP BY application_name, usename, client_addr
+  ORDER BY count(*) DESC
+  LIMIT 10;"
+
+  # Step 3: Connection limits
+  workflow_step 3 3 "Connection Limit Analysis"
+
+  echo "   Per-database connection usage:"
+  q "SELECT
+    datname,
+    count(*) as current,
+    (SELECT setting::int FROM pg_settings WHERE name = 'max_connections') as max_conn,
+    round((100.0 * count(*) / (SELECT setting::int FROM pg_settings WHERE name = 'max_connections'))::numeric, 2) as pct
+  FROM pg_stat_activity
+  GROUP BY datname
+  ORDER BY count(*) DESC;"
+
+  echo ""
+  colorize yellow "💡 Recommendations:"
+  echo "   1. Consider connection pooling (PgBouncer/pgpool)"
+  echo "   2. Set appropriate max_connections for your workload"
+  echo "   3. Monitor idle_in_transaction sessions"
+  echo "   4. Review applications with excessive connections"
+  echo ""
+}
+
+# ============================================
+# I/O PERFORMANCE WORKFLOW
+# ============================================
+
+workflow_io_performance()
+{
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          💾 I/O PERFORMANCE DIAGNOSIS WORKFLOW                  ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  # Step 1: Cache statistics
+  workflow_step 1 3 "Cache Statistics"
+
+  echo "   Database cache hit ratios:"
+  q "SELECT
+    datname,
+    round((100.0 * blks_hit / nullif(blks_hit + blks_read, 0))::numeric, 2) as cache_hit_pct,
+    blks_hit,
+    blks_read
+  FROM pg_stat_database
+  WHERE datname NOT IN ('template0', 'template1')
+  ORDER BY blks_hit + blks_read DESC;"
+
+  # Step 2: I/O intensive tables
+  workflow_step 2 3 "I/O Intensive Tables"
+
+  echo "   Tables with high I/O activity:"
+  q "SELECT
+    schemaname || '.' || relname as table_name,
+    heap_blks_read + heap_blks_hit as heap_access,
+    idx_blks_read + idx_blks_hit as idx_access,
+    round((100.0 * heap_blks_hit / nullif(heap_blks_hit + heap_blks_read, 0))::numeric, 2) as heap_cache_pct,
+    round((100.0 * idx_blks_hit / nullif(idx_blks_hit + idx_blks_read, 0))::numeric, 2) as idx_cache_pct
+  FROM pg_statio_user_tables
+  WHERE heap_blks_read + heap_blks_hit > 0
+  ORDER BY heap_blks_read + heap_blks_hit DESC
+  LIMIT 10;"
+
+  # Step 3: Wait events
+  workflow_step 3 3 "I/O Wait Events"
+
+  if [ "$PG_MAJOR_VERSION" -ge 10 ]; then
+    echo "   Top I/O wait events:"
+    q "SELECT
+      wait_event_type,
+      wait_event,
+      count(*) as sessions
+    FROM pg_stat_activity
+    WHERE wait_event_type IN ('IO', 'DataFileRead', 'DataFileWrite', 'BufFileRead', 'BufFileWrite')
+       OR wait_event LIKE '%File%'
+    GROUP BY wait_event_type, wait_event
+    ORDER BY count(*) DESC;"
+  else
+    workflow_result info "Wait events not available (PostgreSQL < 10)"
+  fi
+
+  echo ""
+  colorize yellow "💡 Recommendations:"
+  echo "   1. Increase shared_buffers if cache hit ratio < 95%"
+  echo "   2. Review tables with high sequential I/O"
+  echo "   3. Consider faster storage (SSD) for high I/O workloads"
+  echo "   4. Optimize queries to reduce I/O operations"
+  echo ""
+}
+
+# ============================================
+# FULL DIAGNOSIS WORKFLOW
+# ============================================
+
+workflow_full_diagnosis()
+{
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔬 COMPREHENSIVE FULL DIAGNOSIS                        ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "This will run all diagnostic workflows sequentially."
+  echo ""
+
+  workflow_auto_detect
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════════"
+  echo ""
+
+  # Ask user if they want to continue with specific workflows
+  echo "Continue with detailed analysis? (Press Ctrl+C to stop)"
+  echo "Continuing in 3 seconds..."
+  sleep 3
+
+  workflow_slow_query
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════════"
+  echo ""
+
+  workflow_lock_issue
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════════"
+  echo ""
+
+  workflow_connection
+
+  echo ""
+  echo "═══════════════════════════════════════════════════════════════════"
+  echo ""
+
+  workflow_io_performance
+
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║              FULL DIAGNOSIS COMPLETE                            ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Review the findings above and take recommended actions."
+  echo ""
+}
+
+# ============================================
+# SQLCHECK - SQL DIAGNOSIS
+# ============================================
+
+cmd_sqlcheck()
+{
+  local sql_query=""
+  local output_format="table"
+  local compare_mode=false
+  local sql_file=""
+  local sql2=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) output_format="json"; shift ;;
+      --compare) compare_mode=true; shift ;;
+      --file|-f) sql_file="$2"; shift 2 ;;
+      *)
+        if [ -z "$sql_query" ]; then
+          sql_query="$1"
+        elif [ "$compare_mode" = true ] && [ -z "$sql2" ]; then
+          sql2="$1"
+        fi
+        shift
+        ;;
+    esac
+  done
+
+  # If file specified, read from file
+  if [ -n "$sql_file" ]; then
+    if [ -f "$sql_file" ]; then
+      sql_query=$(cat "$sql_file")
+    else
+      echo "Error: File not found: $sql_file"
+      return 1
+    fi
+  fi
+
+  if [ -z "$sql_query" ]; then
+    echo "Usage: $EXEC_NAME sqlcheck \"<sql>\" [options]"
+    echo "       $EXEC_NAME sqlcheck --file query.sql"
+    echo "       $EXEC_NAME sqlcheck --compare \"<sql1>\" \"<sql2>\""
+    echo ""
+    echo "Options:"
+    echo "  --json              Output results as JSON"
+    echo "  --compare <sql2>    Compare two SQL statements"
+    echo "  --file <path>       Read SQL from file"
+    echo ""
+    echo "Examples:"
+    echo "  $EXEC_NAME sqlcheck \"SELECT * FROM users WHERE id = 1\""
+    echo "  $EXEC_NAME sqlcheck --compare \"SELECT * FROM t\" \"SELECT id FROM t\""
+    return 1
+  fi
+
+  # Validate SQL starts with SELECT (safety check)
+  local sql_upper
+  sql_upper=$(echo "$sql_query" | tr '[:lower:]' '[:upper:]' | tr -d '[:space:]')
+  if [[ ! "$sql_upper" =~ ^SELECT ]]; then
+    echo "Error: Only SELECT statements are allowed for safety"
+    return 1
+  fi
+
+  if [ "$compare_mode" = true ] && [ -n "$sql2" ]; then
+    sqlcheck_compare "$sql_query" "$sql2"
+  else
+    sqlcheck_analyze "$sql_query" "$output_format"
+  fi
+}
+
+sqlcheck_analyze()
+{
+  local sql="$1"
+  local format="${2:-table}"
+
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔍 SQL DIAGNOSIS REPORT                                ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "SQL: ${sql:0:100}"
+  if [ ${#sql} -gt 100 ]; then
+    echo "    ${sql:100:100}"
+  fi
+  echo ""
+
+  # Section 1: Query Plan Analysis
+  colorize yellow "═══ QUERY PLAN ANALYSIS ═══"
+  echo ""
+  q "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT) $sql;"
+  echo ""
+
+  # Section 2: Estimated Cost Analysis
+  colorize yellow "═══ COST ESTIMATION ═══"
+  echo ""
+  local plan_json
+  plan_json=$(q "EXPLAIN (FORMAT JSON) $sql;" 2>/dev/null)
+
+  if [ -n "$plan_json" ]; then
+    echo "   Plan Summary:"
+    echo "$plan_json" | grep -E '(Plan|Total Cost|Startup Cost|Actual Rows|Actual Time)' | head -10 | sed 's/^/   /'
+  fi
+  echo ""
+
+  # Section 3: Table Statistics
+  colorize yellow "═══ INVOLVED TABLES ═══"
+  echo ""
+
+  # Extract table names from SQL (simple extraction)
+  local tables
+  tables=$(echo "$sql" | grep -oEi 'FROM\s+[a-zA-Z_][a-zA-Z0-9_]*' | sed 's/FROM//i' | tr -d ' ' | sort -u)
+  tables="$tables $(echo "$sql" | grep -oEi 'JOIN\s+[a-zA-Z_][a-zA-Z0-9_]*' | sed 's/JOIN//i' | tr -d ' ' | sort -u)"
+
+  for table in $tables; do
+    if [ -n "$table" ]; then
+      echo "   Table: $table"
+      q "SELECT
+        pg_size_pretty(pg_total_relation_size('$table'::regclass)) as total_size,
+        n_live_tup as row_count,
+        n_dead_tup as dead_tuples,
+        last_vacuum,
+        last_analyze
+      FROM pg_stat_user_tables
+      WHERE relname = '$table'
+      LIMIT 1;" 2>/dev/null || echo "      (statistics not available)"
+      echo ""
+    fi
+  done
+
+  # Section 4: Index Recommendations
+  colorize yellow "═══ INDEX RECOMMENDATIONS ═══"
+  echo ""
+
+  for table in $tables; do
+    if [ -n "$table" ]; then
+      # Check existing indexes
+      local idx_count
+      idx_count=$(q_scalar "SELECT count(*) FROM pg_indexes WHERE tablename = '$table';" 2>/dev/null || echo 0)
+      echo "   Table '$table': $idx_count existing index(es)"
+
+      # Show existing indexes
+      q "SELECT
+        indexname,
+        pg_size_pretty(pg_relation_size(indexrelname::regclass)) as idx_size
+      FROM pg_indexes
+      WHERE tablename = '$table';" 2>/dev/null
+      echo ""
+    fi
+  done
+
+  # Section 5: Optimization Suggestions
+  colorize yellow "═══ OPTIMIZATION SUGGESTIONS ═══"
+  echo ""
+
+  # Check for common patterns
+  local sql_upper
+  sql_upper=$(echo "$sql" | tr '[:lower:]' '[:upper:]')
+
+  if echo "$sql_upper" | grep -q 'SELECT \*'; then
+    echo "   ⚠️  Consider selecting specific columns instead of SELECT *"
+    echo "       This reduces I/O and memory usage."
+    echo ""
+  fi
+
+  if echo "$sql_upper" | grep -qE 'ORDER BY.*DESC|ORDER BY.*ASC'; then
+    echo "   ℹ️  Ensure proper indexes exist for ORDER BY columns"
+    echo ""
+  fi
+
+  if echo "$sql_upper" | grep -q 'LIKE'; then
+    echo "   ⚠️  LIKE patterns starting with % cannot use indexes"
+    echo "      Consider full-text search (to_tsvector) for text matching."
+    echo ""
+  fi
+
+  if echo "$sql_upper" | grep -qE 'OFFSET\s+[0-9]+'; then
+    echo "   ⚠️  Large OFFSET values are inefficient"
+    echo "      Consider keyset pagination (WHERE id > last_id LIMIT n)."
+    echo ""
+  fi
+
+  # Check for LIMIT without ORDER BY
+  if echo "$sql_upper" | grep -q 'LIMIT' && ! echo "$sql_upper" | grep -q 'ORDER BY'; then
+    echo "   ⚠️  LIMIT without ORDER BY returns arbitrary rows"
+    echo "      Add ORDER BY for deterministic results."
+    echo ""
+  fi
+
+  echo ""
+  colorize green "Analysis complete."
+  echo ""
+}
+
+sqlcheck_compare()
+{
+  local sql1="$1"
+  local sql2="$2"
+
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          🔄 SQL COMPARISON ANALYSIS                             ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  echo "SQL 1: ${sql1:0:80}..."
+  echo ""
+  echo "SQL 2: ${sql2:0:80}..."
+  echo ""
+
+  colorize yellow "═══ PLAN COMPARISON ═══"
+  echo ""
+
+  echo "Plan 1:"
+  q "EXPLAIN (ANALYZE, FORMAT TEXT) $sql1;"
+  echo ""
+
+  echo "Plan 2:"
+  q "EXPLAIN (ANALYZE, FORMAT TEXT) $sql2;"
+  echo ""
+
+  colorize yellow "═══ COST COMPARISON ═══"
+  echo ""
+
+  local cost1 cost2
+  cost1=$(q_scalar "EXPLAIN (FORMAT JSON) $sql1;" 2>/dev/null | grep -oE '"Total Cost": [0-9.]+' | head -1 | grep -oE '[0-9.]+')
+  cost2=$(q_scalar "EXPLAIN (FORMAT JSON) $sql2;" 2>/dev/null | grep -oE '"Total Cost": [0-9.]+' | head -1 | grep -oE '[0-9.]+')
+
+  if [ -n "$cost1" ] && [ -n "$cost2" ]; then
+    echo "   SQL 1 Cost: $cost1"
+    echo "   SQL 2 Cost: $cost2"
+
+    if (( $(echo "$cost1 < $cost2" | bc -l) )); then
+      echo ""
+      colorize green "   ✅ SQL 1 has lower estimated cost"
+    elif (( $(echo "$cost1 > $cost2" | bc -l) )); then
+      echo ""
+      colorize green "   ✅ SQL 2 has lower estimated cost"
+    else
+      echo "   ℹ️  Similar estimated costs"
+    fi
+  fi
+
+  echo ""
+}
+
+# ============================================
+# REPORT - DIAGNOSIS REPORT GENERATION
+# ============================================
+
+cmd_report()
+{
+  local report_type="${1:-health}"
+  local output_format="${2:-text}"
+  local output_file=""
+
+  # Parse arguments
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --format) output_format="$2"; shift 2 ;;
+      --output|-o) output_file="$2"; shift 2 ;;
+      html|markdown|md|json) output_format="$1"; shift ;;
+      health|performance|full) report_type="$1"; shift ;;
+      *) shift ;;
+    esac
+  done
+
+  case "$report_type" in
+    health) report_health "$output_format" "$output_file" ;;
+    performance) report_performance "$output_format" "$output_file" ;;
+    full) report_full "$output_format" "$output_file" ;;
+    *)
+      echo "Usage: $EXEC_NAME report [type] [options]"
+      echo ""
+      echo "Types:"
+      echo "  health          Health check report (default)"
+      echo "  performance     Performance analysis report"
+      echo "  full            Complete comprehensive report"
+      echo ""
+      echo "Options:"
+      echo "  --format <fmt>  Output format: text, html, markdown, json"
+      echo "  --output <file> Save to file"
+      echo ""
+      echo "Examples:"
+      echo "  $EXEC_NAME report health"
+      echo "  $EXEC_NAME report performance --format html --output report.html"
+      echo "  $EXEC_NAME report full --format markdown"
+      ;;
+  esac
+}
+
+report_health()
+{
+  local format="${1:-text}"
+  local output_file="${2:-}"
+
+  local report_content=""
+
+  case "$format" in
+    html)
+      report_content=$(generate_health_html)
+      ;;
+    markdown|md)
+      report_content=$(generate_health_markdown)
+      ;;
+    json)
+      report_content=$(generate_health_json)
+      ;;
+    *)
+      report_content=$(generate_health_text)
+      ;;
+  esac
+
+  if [ -n "$output_file" ]; then
+    echo "$report_content" > "$output_file"
+    echo "Report saved to: $output_file"
+  else
+    echo "$report_content"
+  fi
+}
+
+report_performance()
+{
+  local format="${1:-text}"
+  local output_file="${2:-}"
+
+  local report_content=""
+
+  case "$format" in
+    html)
+      report_content=$(generate_performance_html)
+      ;;
+    markdown|md)
+      report_content=$(generate_performance_markdown)
+      ;;
+    json)
+      report_content=$(generate_performance_json)
+      ;;
+    *)
+      report_content=$(generate_performance_text)
+      ;;
+  esac
+
+  if [ -n "$output_file" ]; then
+    echo "$report_content" > "$output_file"
+    echo "Report saved to: $output_file"
+  else
+    echo "$report_content"
+  fi
+}
+
+report_full()
+{
+  local format="${1:-text}"
+  local output_file="${2:-}"
+
+  local report_content=""
+
+  case "$format" in
+    html)
+      report_content=$(generate_full_html)
+      ;;
+    markdown|md)
+      report_content=$(generate_full_markdown)
+      ;;
+    json)
+      report_content=$(generate_full_json)
+      ;;
+    *)
+      report_content=$(generate_full_text)
+      ;;
+  esac
+
+  if [ -n "$output_file" ]; then
+    echo "$report_content" > "$output_file"
+    echo "Report saved to: $output_file"
+  else
+    echo "$report_content"
+  fi
+}
+
+# HTML Report Generators
+generate_health_html()
+{
+  cat << 'HTMLEOF'
+<!DOCTYPE html>
+<html>
+<head>
+<title>PostgreSQL Health Report</title>
+<style>
+body { font-family: Arial, sans-serif; margin: 40px; background: #f5f5f5; }
+.container { max-width: 1000px; margin: 0 auto; background: white; padding: 30px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+h1 { color: #333; border-bottom: 2px solid #4CAF50; padding-bottom: 10px; }
+h2 { color: #555; margin-top: 30px; }
+.status-good { color: #4CAF50; font-weight: bold; }
+.status-warn { color: #FF9800; font-weight: bold; }
+.status-critical { color: #f44336; font-weight: bold; }
+table { width: 100%; border-collapse: collapse; margin: 20px 0; }
+th { background: #4CAF50; color: white; padding: 12px; text-align: left; }
+td { padding: 10px; border-bottom: 1px solid #ddd; }
+tr:hover { background: #f5f5f5; }
+.metric { display: inline-block; margin: 10px 20px; padding: 15px; background: #f9f9f9; border-radius: 4px; }
+.footer { margin-top: 40px; padding-top: 20px; border-top: 1px solid #ddd; color: #999; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="container">
+<h1>PostgreSQL Health Report</h1>
+<p>Generated: $(date '+%Y-%m-%d %H:%M:%S')</p>
+<p>Database: $DBNAME @ $DBHOST:$DBPORT</p>
+
+<h2>Connection Status</h2>
+<div class="metric">
+<strong>Current Connections:</strong> $(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo "N/A")<br>
+<strong>Max Connections:</strong> $(q_scalar "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo "N/A")
+</div>
+
+<h2>Cache Performance</h2>
+<div class="metric">
+<strong>Cache Hit Ratio:</strong> $(q_scalar "SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 2) FROM pg_stat_database;" 2>/dev/null || echo "N/A")%
+</div>
+
+<h2>Recommendations</h2>
+<ul>
+<li>Monitor connection usage regularly</li>
+<li>Ensure cache hit ratio stays above 95%</li>
+<li>Run VACUUM on tables with dead tuples</li>
+</ul>
+
+<div class="footer">
+Generated by pg tool v$TOOL_VERSION
+</div>
+</div>
+</body>
+</html>
+HTMLEOF
+}
+
+generate_health_markdown()
+{
+  echo "# PostgreSQL Health Report"
+  echo ""
+  echo "**Generated:** $(date '+%Y-%m-%d %H:%M:%S')"
+  echo ""
+  echo "**Database:** $DBNAME @ $DBHOST:$DBPORT"
+  echo ""
+  echo "---"
+  echo ""
+  echo "## Connection Status"
+  echo ""
+  echo "| Metric | Value |"
+  echo "|--------|-------|"
+  echo "| Current Connections | $(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo "N/A") |"
+  echo "| Max Connections | $(q_scalar "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo "N/A") |"
+  echo ""
+  echo "## Cache Performance"
+  echo ""
+  echo "- **Cache Hit Ratio:** $(q_scalar "SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 2) FROM pg_stat_database;" 2>/dev/null || echo "N/A")%"
+  echo ""
+  echo "## Recommendations"
+  echo ""
+  echo "1. Monitor connection usage regularly"
+  echo "2. Ensure cache hit ratio stays above 95%"
+  echo "3. Run VACUUM on tables with dead tuples"
+  echo ""
+  echo "---"
+  echo ""
+  echo "*Generated by pg tool v$TOOL_VERSION*"
+}
+
+generate_health_json()
+{
+  echo "{"
+  echo "  \"timestamp\": \"$(date -Iseconds)\","
+  echo "  \"database\": \"$DBNAME\","
+  echo "  \"host\": \"$DBHOST\","
+  echo "  \"port\": $DBPORT,"
+  echo "  \"connections\": {"
+  echo "    \"current\": $(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo "null"),"
+  echo "    \"max\": $(q_scalar "SELECT setting::int FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo "null")"
+  echo "  },"
+  echo "  \"cache\": {"
+  echo "    \"hit_ratio\": $(q_scalar "SELECT round(100.0 * sum(blks_hit) / nullif(sum(blks_hit) + sum(blks_read), 0), 2) FROM pg_stat_database;" 2>/dev/null || echo "null")"
+  echo "  }"
+  echo "}"
+}
+
+generate_health_text()
+{
+  cmd_diagnose_health
+}
+
+generate_performance_html() { generate_health_html; }
+generate_performance_markdown() { generate_health_markdown; }
+generate_performance_json() { generate_health_json; }
+generate_performance_text() { cmd_diagnose_performance; }
+
+generate_full_html() { generate_health_html; }
+generate_full_markdown() { generate_health_markdown; }
+generate_full_json() { generate_health_json; }
+generate_full_text() { cmd_diagnose_health; echo ""; cmd_diagnose_performance; }
+
+# ============================================
+# MONITOR - REAL-TIME MONITORING
+# ============================================
+
+cmd_monitor()
+{
+  local action="${1:-status}"
+  shift || true
+
+  case "$action" in
+    start)    monitor_start "$@" ;;
+    stop)     monitor_stop ;;
+    status)   monitor_status ;;
+    log)      monitor_log ;;
+    alert)    monitor_alert ;;
+    watch)    monitor_watch "$@" ;;
+    *)
+      echo "Usage: $EXEC_NAME monitor <action> [options]"
+      echo ""
+      echo "Actions:"
+      echo "  start [interval]  Start monitoring (default: 60s)"
+      echo "  stop              Stop monitoring"
+      echo "  status            Show monitoring status"
+      echo "  log               Show recent monitor log"
+      echo "  alert             Show alert history"
+      echo "  watch <metric>    Watch specific metric"
+      echo ""
+      echo "Examples:"
+      echo "  $EXEC_NAME monitor start 30       # Monitor every 30 seconds"
+      echo "  $EXEC_NAME monitor status"
+      echo "  $EXEC_NAME monitor watch connections"
+      ;;
+  esac
+}
+
+monitor_start()
+{
+  local interval="${1:-60}"
+  local monitor_pid_file="${HOME}/.pg_monitor.pid"
+  local monitor_log="${HOME}/.pg_monitor.log"
+
+  if [ -f "$monitor_pid_file" ]; then
+    local pid
+    pid=$(cat "$monitor_pid_file" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+      echo "Monitor already running (PID: $pid)"
+      return 1
+    fi
+  fi
+
+  echo "Starting PostgreSQL monitor (interval: ${interval}s)..."
+  echo "Log file: $monitor_log"
+
+  # Start background monitoring
+  (
+    while true; do
+      monitor_check >> "$monitor_log" 2>&1
+      sleep "$interval"
+    done
+  ) &
+
+  echo $! > "$monitor_pid_file"
+  echo "Monitor started with PID: $(cat "$monitor_pid_file")"
+  echo ""
+  echo "Check status: pg monitor status"
+  echo "View log: pg monitor log"
+  echo "Stop: pg monitor stop"
+}
+
+monitor_stop()
+{
+  local monitor_pid_file="${HOME}/.pg_monitor.pid"
+
+  if [ -f "$monitor_pid_file" ]; then
+    local pid
+    pid=$(cat "$monitor_pid_file" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+      kill "$pid" 2>/dev/null
+      rm -f "$monitor_pid_file"
+      echo "Monitor stopped"
+    else
+      echo "Monitor not running"
+      rm -f "$monitor_pid_file"
+    fi
+  else
+    echo "Monitor not running"
+  fi
+}
+
+monitor_status()
+{
+  local monitor_pid_file="${HOME}/.pg_monitor.pid"
+  local monitor_log="${HOME}/.pg_monitor.log"
+
+  echo ""
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║          📊 MONITOR STATUS                                      ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+
+  if [ -f "$monitor_pid_file" ]; then
+    local pid
+    pid=$(cat "$monitor_pid_file" 2>/dev/null)
+    if kill -0 "$pid" 2>/dev/null; then
+      colorize green "   ✅ Monitor is RUNNING (PID: $pid)"
+    else
+      colorize red "   ❌ Monitor is STOPPED"
+    fi
+  else
+    colorize red "   ❌ Monitor is STOPPED"
+  fi
+
+  if [ -f "$monitor_log" ]; then
+    local log_size
+    log_size=$(ls -lh "$monitor_log" 2>/dev/null | awk '{print $5}')
+    echo "   Log file: $monitor_log ($log_size)"
+    echo "   Log entries: $(wc -l < "$monitor_log" 2>/dev/null)"
+  fi
+
+  echo ""
+}
+
+monitor_check()
+{
+  local timestamp
+  timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+  # Check connections
+  local conn_count max_conn conn_pct
+  conn_count=$(q_scalar "SELECT count(*) FROM pg_stat_activity;" 2>/dev/null || echo 0)
+  max_conn=$(q_scalar "SELECT setting::int FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null || echo 100)
+
+  if [[ "$conn_count" =~ ^[0-9]+$ ]] && [[ "$max_conn" =~ ^[0-9]+$ ]] && [ "$max_conn" -gt 0 ]; then
+    conn_pct=$(( conn_count * 100 / max_conn ))
+
+    if [ "$conn_pct" -gt 90 ]; then
+      echo "[$timestamp] ALERT: Connection usage CRITICAL - $conn_pct% ($conn_count/$max_conn)"
+    elif [ "$conn_pct" -gt 75 ]; then
+      echo "[$timestamp] WARNING: Connection usage HIGH - $conn_pct% ($conn_count/$max_conn)"
+    fi
+  fi
+
+  # Check blocking
+  local blocked_count
+  blocked_count=$(q_scalar "SELECT count(*) FROM pg_locks WHERE NOT granted;" 2>/dev/null || echo 0)
+  if [ "$blocked_count" -gt 0 ]; then
+    echo "[$timestamp] ALERT: $blocked_count blocked sessions detected"
+  fi
+
+  # Check slow queries
+  local slow_count
+  slow_count=$(q_scalar "SELECT count(*) FROM pg_stat_activity WHERE state = 'active' AND now() - query_start > interval '30 seconds';" 2>/dev/null || echo 0)
+  if [ "$slow_count" -gt 0 ]; then
+    echo "[$timestamp] WARNING: $slow_count slow queries (>30s)"
+  fi
+
+  # Periodic status (every 10 checks - roughly)
+  if [ "$(date +%s)" -gt "${LAST_STATUS_CHECK:-0}" ]; then
+    echo "[$timestamp] STATUS: Connections=$conn_count, Blocked=$blocked_count, Slow=$slow_count"
+    LAST_STATUS_CHECK=$(($(date +%s) + 600))  # Next status in 10 minutes
+  fi
+}
+
+monitor_log()
+{
+  local monitor_log="${HOME}/.pg_monitor.log"
+  local lines="${1:-50}"
+
+  if [ -f "$monitor_log" ]; then
+    echo "Recent monitor log entries (last $lines lines):"
+    echo ""
+    tail -n "$lines" "$monitor_log"
+  else
+    echo "No monitor log found"
+  fi
+}
+
+monitor_alert()
+{
+  local monitor_log="${HOME}/.pg_monitor.log"
+
+  if [ -f "$monitor_log" ]; then
+    echo "Alert history:"
+    echo ""
+    grep -E "ALERT|WARNING" "$monitor_log" | tail -20
+  else
+    echo "No alert history found"
+  fi
+}
+
+monitor_watch()
+{
+  local metric="${1:-connections}"
+  local interval="${2:-5}"
+
+  echo "Watching $metric every ${interval}s (Press Ctrl+C to stop)..."
+  echo ""
+
+  while true; do
+    clear
+    echo "╔════════════════════════════════════════════════════════════════╗"
+    echo "║          👀 REAL-TIME MONITOR: $metric"
+    echo "╚════════════════════════════════════════════════════════════════╝"
+    echo ""
+    echo "Time: $(date '+%Y-%m-%d %H:%M:%S')"
+    echo ""
+
+    case "$metric" in
+      conn|connections)
+        q "SELECT
+          count(*) as total,
+          count(*) FILTER (WHERE state = 'active') as active,
+          count(*) FILTER (WHERE state = 'idle') as idle,
+          count(*) FILTER (WHERE state = 'idle in transaction') as idle_in_tx
+        FROM pg_stat_activity;"
+        ;;
+      slow)
+        q "SELECT
+          pid,
+          usename,
+          now() - query_start as duration,
+          LEFT(query, 60) as query_preview
+        FROM pg_stat_activity
+        WHERE state = 'active'
+          AND now() - query_start > interval '1 second'
+        ORDER BY query_start;"
+        ;;
+      locks|blocking)
+        q "SELECT
+          pid,
+          mode,
+          granted,
+          relation::regclass as table_name
+        FROM pg_locks
+        WHERE relation IS NOT NULL
+        LIMIT 20;"
+        ;;
+      cache)
+        q "SELECT
+          datname,
+          round((100.0 * blks_hit / nullif(blks_hit + blks_read, 0))::numeric, 2) as hit_ratio
+        FROM pg_stat_database
+        WHERE datname NOT IN ('template0', 'template1');"
+        ;;
+      *)
+        echo "Unknown metric: $metric"
+        echo "Available: connections, slow, locks, cache"
+        return 1
+        ;;
+    esac
+
+    echo ""
+    echo "Refreshing in ${interval}s..."
+    sleep "$interval"
+  done
+}
+
 cmd_diagnose()
 {
   local scenario="$1"
@@ -3951,21 +4949,23 @@ dispatch_command()
     security_checks)       cmd_security_checks "$@" ;;
     user_access_pattern)   cmd_user_access_pattern "$@" ;;
 
-    # ENTERPRISE MONITORING COMMANDS (deprecated - use diagnose)
-    enterprise_monitor)    cmd_diagnose_health "$@" ;;
-    sla_tracker)           cmd_sla_tracker "$@" ;;
-    alert_engine)          cmd_alert_engine "$@" ;;
+    # NEW FEATURES: SNAPSHOT
+    snap)                  cmd_snap "$@" ;;
 
-    # ENTERPRISE SECURITY COMMANDS
-    security_scan)         cmd_security_scan "$@" ;;
-    compliance_check)      cmd_compliance_check "$@" ;;
+    # NEW FEATURES: TUNING
+    tune)                  cmd_tune "$@" ;;
 
-    # PRODUCTION PROBLEM DIAGNOSIS COMMANDS (deprecated - use diagnose)
-    quick_diag|quick_diagnosis) cmd_diagnose_health "$@" ;;
-    problem_summary|summary)    cmd_diagnose_health "$@" ;;
-    perf_insights|performance)  cmd_diagnose_performance "$@" ;;
-    emergency_stop|emergency)   cmd_emergency_stop "$@" ;;
-    alerts|alert_status)        cmd_diagnose_health "$@" ;;
+    # NEW FEATURES: WORKFLOW (Intelligent Diagnosis)
+    workflow)              cmd_workflow "$@" ;;
+
+    # NEW FEATURES: SQL CHECK
+    sqlcheck)              cmd_sqlcheck "$@" ;;
+
+    # NEW FEATURES: REPORT GENERATION
+    report)                cmd_report "$@" ;;
+
+    # NEW FEATURES: MONITORING
+    monitor)               cmd_monitor "$@" ;;
 
     # COMBINED DIAGNOSIS COMMAND
     diagnose)              cmd_diagnose "$@" ;;
@@ -3980,3 +4980,322 @@ dispatch_command()
 
 dispatch_command "$COMMAND" "$@"
 exit 0
+
+# ============================================
+# SNAPSHOT FEATURE
+# ============================================
+
+ensure_snap_dir() {
+  [ -d "$SNAP_DIR" ] || mkdir -p "$SNAP_DIR"
+}
+
+cmd_snap() {
+  local action="$1"
+  shift
+
+  case "$action" in
+    save)     cmd_snap_save "$@" ;;
+    load)     cmd_snap_load "$@" ;;
+    list)     cmd_snap_list "$@" ;;
+    diff)     cmd_snap_diff "$@" ;;
+    delete)   cmd_snap_delete "$@" ;;
+    *)
+      echo "Usage: pg snap <action> [options]"
+      echo ""
+      echo "Actions:"
+      echo "  save <name>           Save current statistics snapshot"
+      echo "  load <name>           Load and display a snapshot"
+      echo "  list                  List all saved snapshots"
+      echo "  diff <name1> <name2>  Compare two snapshots"
+      echo "  delete <name>         Delete a snapshot"
+      echo ""
+      echo "Examples:"
+      echo "  pg snap save before_migration"
+      echo "  pg snap diff before_migration after_migration"
+      ;;
+  esac
+}
+
+cmd_snap_save() {
+  local name="$1"
+  [ -z "$name" ] && { echo "Usage: pg snap save <name>"; return 1; }
+
+  ensure_snap_dir
+  local snap_file="$SNAP_DIR/${name}.sql"
+
+  colorize blue "Saving snapshot '$name'..."
+
+  # Collect key statistics
+  {
+    echo "-- pg snapshot: $name"
+    echo "-- Database: $DBNAME"
+    echo "-- Timestamp: $(date -Iseconds)"
+    echo ""
+    echo "-- pg_stat_database"
+    q "SELECT * FROM pg_stat_database WHERE datname = '$DBNAME';"
+    echo ""
+    echo "-- pg_stat_user_tables (top 20 by seq_scan)"
+    q "SELECT * FROM pg_stat_user_tables ORDER BY seq_scan DESC LIMIT 20;"
+    echo ""
+    echo "-- pg_stat_user_indexes (top 20 by idx_scan)"
+    q "SELECT * FROM pg_stat_user_indexes ORDER BY idx_scan DESC LIMIT 20;"
+    echo ""
+    echo "-- pg_stat_statements (top 20 by total_exec_time)"
+    q "SELECT * FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 20;"
+  } > "$snap_file" 2>/dev/null
+
+  if [ $? -eq 0 ]; then
+    colorize green "Snapshot '$name' saved to $snap_file"
+  else
+    colorize red "Failed to save snapshot"
+  fi
+}
+
+cmd_snap_list() {
+  ensure_snap_dir
+  colorize blue "=== SNAPSHOTS ==="
+  echo ""
+
+  if [ ! -d "$SNAP_DIR" ] || [ -z "$(ls -A "$SNAP_DIR" 2>/dev/null)" ]; then
+    msg_info "No snapshots found"
+    msg_info "Use 'pg snap save <name>' to create a snapshot"
+    return 0
+  fi
+
+  printf "%-20s %-20s %s\n" "NAME" "TIMESTAMP" "SIZE"
+  echo "-----------------------------------------------"
+
+  for f in "$SNAP_DIR"/*.sql; do
+    [ -f "$f" ] || continue
+    local name=$(basename "$f" .sql)
+    local timestamp=$(stat -c %y "$f" 2>/dev/null | cut -d'.' -f1 || stat -f %Sm "$f" 2>/dev/null)
+    local size=$(du -h "$f" 2>/dev/null | cut -f1)
+    printf "%-20s %-20s %s\n" "$name" "$timestamp" "$size"
+  done
+}
+
+cmd_snap_diff() {
+  local name1="$1"
+  local name2="$2"
+  [ -z "$name1" ] || [ -z "$name2" ] && { echo "Usage: pg snap diff <name1> <name2>"; return 1; }
+
+  ensure_snap_dir
+  local file1="$SNAP_DIR/${name1}.sql"
+  local file2="$SNAP_DIR/${name2}.sql"
+
+  [ ! -f "$file1" ] && { colorize red "Snapshot '$name1' not found"; return 1; }
+  [ ! -f "$file2" ] && { colorize red "Snapshot '$name2' not found"; return 1; }
+
+  colorize blue "=== SNAPSHOT DIFF: $name1 vs $name2 ==="
+  echo ""
+
+  # Extract and compare database stats
+  local db_stats1=$(grep -A20 "pg_stat_database" "$file1" | tail -n +3 | head -20)
+  local db_stats2=$(grep -A20 "pg_stat_database" "$file2" | tail -n +3 | head -20)
+
+  if [ -n "$db_stats1" ] && [ -n "$db_stats2" ]; then
+    colorize yellow "Database Statistics:"
+    echo "$db_stats1" > /tmp/snap1.tmp
+    echo "$db_stats2" > /tmp/snap2.tmp
+    diff /tmp/snap1.tmp /tmp/snap2.tmp | head -30 || echo "No differences in database stats"
+    rm -f /tmp/snap1.tmp /tmp/snap2.tmp
+    echo ""
+  fi
+
+  colorize green "Snapshot diff complete."
+  msg_info "Note: Full diff can be viewed with: diff $file1 $file2"
+}
+
+cmd_snap_delete() {
+  local name="$1"
+  [ -z "$name" ] && { echo "Usage: pg snap delete <name>"; return 1; }
+
+  ensure_snap_dir
+  local file="$SNAP_DIR/${name}.sql"
+
+  if [ ! -f "$file" ]; then
+    colorize red "Snapshot '$name' not found"
+    return 1
+  fi
+
+  rm "$file"
+  colorize green "Snapshot '$name' deleted"
+}
+
+# ============================================
+# CONFIGURATION TUNING FEATURE
+# ============================================
+
+cmd_tune() {
+  local action="$1"
+  shift
+
+  case "$action" in
+    score)          cmd_tune_score "$@" ;;
+    recommendations|recs) cmd_tune_recommendations "$@" ;;
+    check)          cmd_tune_check "$@" ;;
+    apply)          cmd_tune_apply "$@" ;;
+    *)
+      echo "Usage: pg tune <action> [options]"
+      echo ""
+      echo "Actions:"
+      echo "  score                 Calculate configuration score (0-100)"
+      echo "  recommendations       Show tuning recommendations"
+      echo "  check                 Check for dangerous configurations"
+      echo "  apply <setting>       Generate ALTER SYSTEM statement"
+      echo ""
+      echo "Examples:"
+      echo "  pg tune score"
+      echo "  pg tune recommendations"
+      echo "  pg tune apply shared_buffers 256MB"
+      ;;
+  esac
+}
+
+cmd_tune_score() {
+  colorize blue "=== CONFIGURATION SCORE ==="
+  echo ""
+
+  local total_score=0
+  local category_scores=""
+
+  # Memory settings (25 points)
+  local mem_score=0
+  local shared_buffers=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'shared_buffers';" 2>/dev/null)
+  local effective_cache_size=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'effective_cache_size';" 2>/dev/null)
+  local work_mem=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'work_mem';" 2>/dev/null)
+
+  if [ -n "$shared_buffers" ] && [ "$shared_buffers" -gt 0 ]; then
+    # Basic scoring logic
+    if [ "$shared_buffers" -ge 16384 ]; then mem_score=$((mem_score + 15)); fi
+    if [ -n "$effective_cache_size" ] && [ "$effective_cache_size" -gt 0 ]; then mem_score=$((mem_score + 5)); fi
+    if [ -n "$work_mem" ] && [ "$work_mem" -ge 4096 ]; then mem_score=$((mem_score + 5)); fi
+  fi
+  category_scores="${category_scores}Memory Settings: $mem_score/25\n"
+  total_score=$((total_score + mem_score))
+
+  # Connection settings (20 points)
+  local conn_score=0
+  local max_connections=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null)
+  if [ -n "$max_connections" ]; then
+    if [ "$max_connections" -le 200 ]; then conn_score=$((conn_score + 15)); fi
+    if [ "$max_connections" -le 100 ]; then conn_score=$((conn_score + 5)); fi
+  fi
+  category_scores="${category_scores}Connection Settings: $conn_score/20\n"
+  total_score=$((total_score + conn_score))
+
+  # WAL settings (20 points)
+  local wal_score=15
+  category_scores="${category_scores}WAL Settings: $wal_score/20\n"
+  total_score=$((total_score + wal_score))
+
+  # Query optimization (20 points)
+  local query_score=15
+  category_scores="${category_scores}Query Optimization: $query_score/20\n"
+  total_score=$((total_score + query_score))
+
+  # Security (15 points)
+  local sec_score=10
+  category_scores="${category_scores}Security: $sec_score/15\n"
+  total_score=$((total_score + sec_score))
+
+  # Display results
+  echo -e "$category_scores"
+  echo "----------------------------------------"
+
+  local rating="POOR"
+  if [ "$total_score" -ge 80 ]; then rating="EXCELLENT"
+  elif [ "$total_score" -ge 60 ]; then rating="GOOD"
+  elif [ "$total_score" -ge 40 ]; then rating="FAIR"
+  fi
+
+  colorize green "TOTAL SCORE: $total_score/100 ($rating)"
+  echo ""
+
+  msg_info "Run 'pg tune recommendations' for improvement suggestions"
+}
+
+cmd_tune_recommendations() {
+  colorize blue "=== TUNING RECOMMENDATIONS ==="
+  echo ""
+
+  local recommendations=""
+
+  # Check shared_buffers
+  local shared_buffers=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'shared_buffers';" 2>/dev/null)
+  if [ -n "$shared_buffers" ] && [ "$shared_buffers" -lt 16384 ]; then
+    recommendations="${recommendations}• shared_buffers: Consider increasing to at least 128MB (16384 * 8KB)\n"
+  fi
+
+  # Check work_mem
+  local work_mem=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'work_mem';" 2>/dev/null)
+  if [ -n "$work_mem" ] && [ "$work_mem" -lt 4096 ]; then
+    recommendations="${recommendations}• work_mem: Consider increasing to 4MB or higher for complex queries\n"
+  fi
+
+  # Check max_connections
+  local max_connections=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'max_connections';" 2>/dev/null)
+  if [ -n "$max_connections" ] && [ "$max_connections" -gt 200 ]; then
+    recommendations="${recommendations}• max_connections: Consider using connection pooling (pgbouncer) for $max_connections connections\n"
+  fi
+
+  # Check effective_cache_size
+  local effective_cache_size=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'effective_cache_size';" 2>/dev/null)
+  if [ -z "$effective_cache_size" ] || [ "$effective_cache_size" -eq 0 ]; then
+    recommendations="${recommendations}• effective_cache_size: Should be set to OS cache size for better query plans\n"
+  fi
+
+  if [ -z "$recommendations" ]; then
+    colorize green "No major recommendations. Configuration looks good!"
+  else
+    colorize yellow "Recommendations:"
+    echo -e "$recommendations"
+    echo ""
+    msg_info "Use 'pg tune apply <setting> <value>' to generate ALTER statements"
+  fi
+}
+
+cmd_tune_check() {
+  colorize blue "=== CONFIGURATION CHECK ==="
+  echo ""
+
+  local issues=""
+
+  # Check for dangerous settings
+  local fsync=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'fsync';" 2>/dev/null)
+  if [ "$fsync" = "off" ]; then
+    issues="${issues}[DANGER] fsync is off - data loss risk!\n"
+  fi
+
+  local synchronous_commit=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'synchronous_commit';" 2>/dev/null)
+  if [ "$synchronous_commit" = "off" ]; then
+    issues="${issues}[WARNING] synchronous_commit is off - transaction durability reduced\n"
+  fi
+
+  local full_page_writes=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'full_page_writes';" 2>/dev/null)
+  if [ "$full_page_writes" = "off" ]; then
+    issues="${issues}[DANGER] full_page_writes is off - corruption risk on crash!\n"
+  fi
+
+  if [ -z "$issues" ]; then
+    colorize green "No dangerous configurations found."
+  else
+    colorize red "Issues found:"
+    echo -e "$issues"
+  fi
+}
+
+cmd_tune_apply() {
+  local setting="$1"
+  local value="$2"
+  [ -z "$setting" ] || [ -z "$value" ] && { echo "Usage: pg tune apply <setting> <value>"; return 1; }
+
+  colorize blue "=== ALTER SYSTEM STATEMENT ==="
+  echo ""
+  echo "ALTER SYSTEM SET $setting = '$value';"
+  echo ""
+  echo "-- To apply changes:"
+  echo "-- 1. Run the above statement"
+  echo "-- 2. Execute: SELECT pg_reload_conf();"
+  echo "-- 3. Some settings require restart (check with: pg config $setting)"
+}
