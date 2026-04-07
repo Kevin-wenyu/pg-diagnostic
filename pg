@@ -947,6 +947,11 @@ Commands:
     partition ddl <table>     Generate partition DDL
     partition info [table]    Show partition information
 
+  === PARTITION (Existing partition tables) ===
+    partitions              List all partitioned tables
+    partition_info          Show partition details
+    partition_summary       Partition summary by table
+
   === WAL & CHECKPOINT ===
     wal                     WAL position info
     checkpoint              Checkpoint statistics
