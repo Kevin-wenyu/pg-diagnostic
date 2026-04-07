@@ -351,6 +351,15 @@ readonly SQL_REPLICATION_SLOTS="SELECT slot_name, slot_type, active, active_pid,
     pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag,
     safe_wal_size, wal_status
 FROM pg_replication_slots ORDER BY active DESC"
+readonly SQL_REPLICATION_SLOT_LAG="SELECT slot_name, slot_type, active,
+    pg_size_pretty(pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn)) AS lag,
+    pg_wal_lsn_diff(pg_current_wal_lsn(), restart_lsn) AS lag_bytes,
+    restart_lsn,
+    pg_current_wal_lsn() AS current_lsn,
+    wal_status,
+    safe_wal_size
+FROM pg_replication_slots
+ORDER BY lag_bytes DESC"
 
 # Performance queries
 # shellcheck disable=SC2034
