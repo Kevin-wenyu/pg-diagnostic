@@ -6289,6 +6289,7 @@ dispatch_command()
     bloat_analysis)        cmd_bloat_analysis "$@" ;;
     toast_tables)          cmd_toast_tables "$@" ;;
     partitions|partition_info) cmd_partition_info "$@" ;;
+    partition)             cmd_partition "$@" ;;
     partition_summary)     cmd_partition_summary "$@" ;;
     slot_usage)            cmd_slot_usage "$@" ;;
     active_txs|active_transactions) cmd_active_transactions "$@" ;;
