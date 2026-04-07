@@ -2528,6 +2528,10 @@ _partition_generate_range()
         next_date=$(date -d "$current_date + 1 month" '+%Y-%m-01' 2>/dev/null || date -v+1m -j -f '%Y-%m-%d' "$current_date" '+%Y-%m-01' 2>/dev/null)
         partition_name="${table}_$(date -d "$current_date" '+%Y%m' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%Y%m' 2>/dev/null)"
         ;;
+      weekly)
+        next_date=$(date -d "$current_date + 7 days" '+%Y-%m-%d' 2>/dev/null || date -v+7d -j -f '%Y-%m-%d' "$current_date" '+%Y-%m-%d' 2>/dev/null)
+        partition_name="${table}_$(date -d "$current_date" '+%YW%U' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%YW%U' 2>/dev/null)"
+        ;;
       yearly)
         next_date=$(date -d "$current_date + 1 year" '+%Y-01-01' 2>/dev/null || date -v+1y -j -f '%Y-%m-%d' "$current_date" '+%Y-01-01' 2>/dev/null)
         partition_name="${table}_$(date -d "$current_date" '+%Y' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%Y' 2>/dev/null)"
