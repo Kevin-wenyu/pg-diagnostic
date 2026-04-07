@@ -134,6 +134,29 @@ The tool supports multiple authentication methods:
 | `slot_usage` | Replication slot usage warning |
 | `slot_lag` | Replication slot lag with warnings |
 
+### Partition (Table Partitioning)
+
+| Command | Description |
+|---------|-------------|
+| `partition advice <table>` | Analyze table and recommend partitioning strategy |
+| `partition ddl <table>` | Generate partition DDL statements |
+| `partition info [table]` | Show partition information |
+
+Examples:
+```bash
+# Analyze orders table for partitioning
+pg partition advice orders
+
+# Generate RANGE partition DDL for orders table
+pg partition ddl orders --type=range --column=created_at --interval=monthly
+
+# Show all partitioned tables
+pg partition info
+
+# Show details for specific table
+pg partition info orders
+```
+
 ### WAL & Checkpoint
 
 | Command | Description |
