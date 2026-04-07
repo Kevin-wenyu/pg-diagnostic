@@ -2377,6 +2377,119 @@ cmd_slot_lag()
   fi
 }
 
+cmd_partition_advice()
+{
+  local table="$1"
+
+  if [ -z "$table" ]; then
+    echo "Usage: pg partition advice <table>"
+    echo ""
+    echo "Analyze a table and recommend partitioning strategies."
+    return 1
+  fi
+
+  # Sanitize table name
+  table=$(q_sanitize "$table")
+
+  # Check if table exists
+  local table_info
+  table_info=$(q "$(printf "$SQL_PARTITION_TABLE_STATS" "$table")" 2>/dev/null)
+
+  if [ -z "$table_info" ]; then
+    msg_error "Table '$table' not found"
+    return 1
+  fi
+
+  # Check if already partitioned
+  local partition_check
+  partition_check=$(q "$(printf "$SQL_PARTITION_EXISTS" "$table")" 2>/dev/null)
+
+  if echo "$partition_check" | grep -q "t"; then
+    colorize yellow "Note: Table '$table' is already partitioned"
+    echo ""
+  fi
+
+  # Display header
+  colorize blue "=== PARTITION ANALYSIS: $table ==="
+  echo ""
+
+  # Show table stats
+  echo "$table_info"
+  echo ""
+
+  # Get size in bytes for analysis
+  local size_bytes
+  size_bytes=$(q_scalar "SELECT pg_total_relation_size('$table'::regclass)" 2>/dev/null)
+
+  # Get row count
+  local row_count
+  row_count=$(q_scalar "SELECT reltuples::bigint FROM pg_class WHERE relname = '$table'" 2>/dev/null)
+
+  # Analyze columns
+  local columns
+  columns=$(q "$(printf "$SQL_PARTITION_COLUMNS" "$table")" 2>/dev/null)
+
+  if [ -n "$columns" ]; then
+    colorize blue "--- Column Analysis ---"
+    echo "$columns"
+    echo ""
+  fi
+
+  # Generate recommendations
+  colorize blue "--- Partitioning Recommendations ---"
+  echo ""
+
+  # Check if table is large enough to benefit from partitioning
+  if [ -n "$size_bytes" ] && [ "$size_bytes" -gt 10737418240 ]; then  # 10GB
+    colorize green "✓ Table size ($size_bytes bytes) exceeds 10GB threshold"
+    echo "  Partitioning is recommended for tables > 10GB"
+    echo ""
+  elif [ -n "$row_count" ] && [ "$row_count" -gt 10000000 ]; then  # 10M rows
+    colorize green "✓ Table has $row_count rows (exceeds 10M threshold)"
+    echo "  Partitioning is recommended for large tables"
+    echo ""
+  else
+    colorize yellow "⚠ Table may not benefit significantly from partitioning"
+    echo "  Consider partitioning when table exceeds 10GB or 10M rows"
+    echo ""
+  fi
+
+  # Identify candidate columns
+  local time_column
+  time_column=$(echo "$columns" | grep "date_time" | head -1 | awk '{print $1}')
+
+  local pk_column
+  pk_column=$(echo "$columns" | awk '$5 == "t" {print $1}' | head -1)
+
+  if [ -n "$time_column" ]; then
+    colorize green "✓ Candidate column found: $time_column (date/time type)"
+    echo "  Recommended partition type: RANGE"
+    echo "  Recommended column: $time_column"
+
+    # Get time range
+    local time_range
+    time_range=$(q "SELECT MIN($time_column), MAX($time_column) FROM $table" 2>/dev/null)
+    if [ -n "$time_range" ]; then
+      echo "  Data range: $time_range"
+    fi
+    echo ""
+  fi
+
+  if [ -n "$pk_column" ]; then
+    echo "  Primary key: $pk_column"
+    echo ""
+  fi
+
+  # General recommendations
+  echo "General Guidelines:"
+  echo "  • RANGE: Best for time-series data (logs, events, orders)"
+  echo "  • LIST: Best for categorical data (regions, statuses, types)"
+  echo "  • HASH: Best for even distribution when no natural range"
+  echo ""
+  echo "Next steps:"
+  echo "  pg partition ddl $table --type=range --column=<column>"
+}
+
 # ============================================
 # WAL & CHECKPOINT
 # ============================================
