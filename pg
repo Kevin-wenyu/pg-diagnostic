@@ -361,6 +361,75 @@ readonly SQL_REPLICATION_SLOT_LAG="SELECT slot_name, slot_type, active,
 FROM pg_replication_slots
 ORDER BY lag_bytes DESC"
 
+# Partition analysis queries
+# shellcheck disable=SC2034
+readonly SQL_PARTITION_TABLE_STATS="SELECT
+    c.relname as table_name,
+    pg_size_pretty(pg_total_relation_size(c.oid)) as total_size,
+    pg_total_relation_size(c.oid) as size_bytes,
+    s.n_live_tup as live_tuples,
+    s.n_dead_tup as dead_tuples
+FROM pg_class c
+JOIN pg_stat_user_tables s ON c.relname = s.relname
+WHERE c.relname = '%s' AND c.relkind = 'r'"
+
+readonly SQL_PARTITION_COLUMNS="SELECT
+    a.attname as column_name,
+    pg_catalog.format_type(a.atttypid, a.atttypmod) as data_type,
+    CASE
+        WHEN a.atttypid IN (1082, 1114, 1184, 1182) THEN 'date_time'
+        WHEN a.atttypid IN (20, 21, 23, 700, 701, 1700) THEN 'numeric'
+        WHEN a.atttypid IN (1042, 1043, 25) THEN 'string'
+        ELSE 'other'
+    END as category,
+    CASE WHEN a.attname IN (
+        SELECT a2.attname
+        FROM pg_index i
+        JOIN pg_attribute a2 ON i.indrelid = a2.attrelid
+        WHERE i.indrelid = c.oid AND a2.attnum = ANY(i.indkey) AND i.indisprimary
+    ) THEN true ELSE false END as is_pk
+FROM pg_attribute a
+JOIN pg_class c ON a.attrelid = c.oid
+WHERE c.relname = '%s'
+    AND a.attnum > 0
+    AND NOT a.attisdropped
+ORDER BY a.attnum"
+
+readonly SQL_PARTITION_EXISTS="SELECT
+    c.relkind,
+    CASE WHEN pt.partrelid IS NOT NULL THEN true ELSE false END as is_partitioned
+FROM pg_class c
+LEFT JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
+WHERE c.relname = '%s'"
+
+readonly SQL_PARTITION_LIST="SELECT
+    c.relname as table_name,
+    pg_get_partkeydef(c.oid) as partition_key,
+    c.relhassubclass as has_partitions
+FROM pg_class c
+JOIN pg_partitioned_table pt ON c.oid = pt.partrelid
+ORDER BY c.relname"
+
+readonly SQL_PARTITION_DETAIL="SELECT
+    c.relname as partition_name,
+    pg_get_expr(c.relpartbound, c.oid) as partition_bounds,
+    pg_size_pretty(pg_total_relation_size(c.oid)) as size,
+    COALESCE(s.n_live_tup, 0) as rows
+FROM pg_class c
+JOIN pg_inherits i ON c.oid = i.inhrelid
+JOIN pg_class parent ON i.inhparent = parent.oid
+LEFT JOIN pg_stat_user_tables s ON c.relname = s.relname
+WHERE parent.relname = '%s'
+ORDER BY c.relname"
+
+readonly SQL_PARTITION_COLUMN_STATS="SELECT
+    attname as column_name,
+    n_distinct,
+    null_frac,
+    correlation
+FROM pg_stats
+WHERE tablename = '%s' AND schemaname = 'public'"
+
 # Performance queries
 # shellcheck disable=SC2034
 readonly SQL_CACHE_HIT="SELECT
