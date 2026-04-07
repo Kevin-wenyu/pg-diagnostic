@@ -132,6 +132,7 @@ The tool supports multiple authentication methods:
 | `repl_lag` | Replication lag details |
 | `slot` | Replication slots |
 | `slot_usage` | Replication slot usage warning |
+| `slot_lag` | Replication slot lag with warnings |
 
 ### WAL & Checkpoint
 
