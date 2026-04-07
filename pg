@@ -873,6 +873,11 @@ Commands:
     slot_usage              Replication slot usage warning
     slot_lag                Replication slot lag with warnings
 
+  === PARTITION (Table Partitioning) ===
+    partition advice <table>  Analyze and recommend partitioning
+    partition ddl <table>     Generate partition DDL
+    partition info [table]    Show partition information
+
   === WAL & CHECKPOINT ===
     wal                     WAL position info
     checkpoint              Checkpoint statistics
