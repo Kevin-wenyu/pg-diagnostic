@@ -2490,6 +2490,186 @@ cmd_partition_advice()
   echo "  pg partition ddl $table --type=range --column=<column>"
 }
 
+_partition_generate_range()
+{
+  local table="$1"
+  local column="$2"
+  local interval="$3"  # daily, weekly, monthly, yearly
+  local start_date="$4"
+  local partitions="$5"
+  local with_data="$6"
+
+  echo "-- Partition DDL for table: $table"
+  echo "-- Generated: $(date)"
+  echo ""
+
+  # Create partitioned table
+  echo "-- 1. Create partitioned table"
+  echo "CREATE TABLE ${table}_partitioned ("
+  echo "    LIKE $table INCLUDING ALL"
+  echo ") PARTITION BY RANGE ($column);"
+  echo ""
+
+  # Generate partition definitions
+  echo "-- 2. Create partitions"
+  local i=0
+  local current_date="$start_date"
+
+  while [ $i -lt $partitions ]; do
+    local next_date
+    local partition_name
+
+    case "$interval" in
+      daily)
+        next_date=$(date -d "$current_date + 1 day" '+%Y-%m-%d' 2>/dev/null || date -v+1d -j -f '%Y-%m-%d' "$current_date" '+%Y-%m-%d' 2>/dev/null)
+        partition_name="${table}_$(date -d "$current_date" '+%Y%m%d' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%Y%m%d' 2>/dev/null)"
+        ;;
+      monthly)
+        next_date=$(date -d "$current_date + 1 month" '+%Y-%m-01' 2>/dev/null || date -v+1m -j -f '%Y-%m-%d' "$current_date" '+%Y-%m-01' 2>/dev/null)
+        partition_name="${table}_$(date -d "$current_date" '+%Y%m' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%Y%m' 2>/dev/null)"
+        ;;
+      yearly)
+        next_date=$(date -d "$current_date + 1 year" '+%Y-01-01' 2>/dev/null || date -v+1y -j -f '%Y-%m-%d' "$current_date" '+%Y-01-01' 2>/dev/null)
+        partition_name="${table}_$(date -d "$current_date" '+%Y' 2>/dev/null || date -j -f '%Y-%m-%d' "$current_date" '+%Y' 2>/dev/null)"
+        ;;
+    esac
+
+    echo "CREATE TABLE ${partition_name} PARTITION OF ${table}_partitioned"
+    echo "    FOR VALUES FROM ('$current_date') TO ('$next_date');"
+    echo ""
+
+    current_date="$next_date"
+    i=$((i + 1))
+  done
+
+  # Optional: Data migration
+  if [ "$with_data" = "true" ]; then
+    echo "-- 3. Migrate data (run during maintenance window)"
+    echo "INSERT INTO ${table}_partitioned SELECT * FROM $table;"
+    echo ""
+    echo "-- 4. Switch table names (requires exclusive lock)"
+    echo "BEGIN;"
+    echo "    ALTER TABLE $table RENAME TO ${table}_old;"
+    echo "    ALTER TABLE ${table}_partitioned RENAME TO $table;"
+    echo "COMMIT;"
+    echo ""
+    echo "-- 5. Verify and drop old table"
+    echo "-- DROP TABLE ${table}_old;"
+  fi
+}
+
+cmd_partition_ddl()
+{
+  local table=""
+  local type="range"
+  local column=""
+  local interval="monthly"
+  local start_date=""
+  local partitions="12"
+  local values=""
+  local partition_count="16"
+  local with_data="false"
+  local output_file=""
+
+  # Parse first argument (table name)
+  if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
+    table="$1"
+    shift
+  fi
+
+  # Parse options
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --type) type="$2"; shift 2 ;;
+      --column) column="$2"; shift 2 ;;
+      --interval) interval="$2"; shift 2 ;;
+      --start) start_date="$2"; shift 2 ;;
+      --partitions) partitions="$2"; shift 2 ;;
+      --values) values="$2"; shift 2 ;;
+      --partition-count) partition_count="$2"; shift 2 ;;
+      --migrate) with_data="true"; shift ;;
+      --output) output_file="$2"; shift 2 ;;
+      *) shift ;;
+    esac
+  done
+
+  if [ -z "$table" ]; then
+    echo "Usage: pg partition ddl <table> [options]"
+    echo ""
+    echo "Options:"
+    echo "  --type {range|list|hash}   Partition type (default: range)"
+    echo "  --column <name>            Partition column (auto-detected if not specified)"
+    echo "  --interval <granularity>   For RANGE: daily|weekly|monthly|yearly"
+    echo "  --start <date>             Start date for RANGE (default: today)"
+    echo "  --partitions <n>           Number of partitions for RANGE (default: 12)"
+    echo "  --values <list>            For LIST: comma-separated values"
+    echo "  --partition-count <n>      For HASH: number of partitions (default: 16)"
+    echo "  --migrate                  Include data migration statements"
+    echo "  --output <file>            Save DDL to file (default: stdout)"
+    return 1
+  fi
+
+  # Sanitize
+  table=$(q_sanitize "$table")
+  column=$(q_sanitize "$column")
+
+  # Verify table exists
+  local table_exists
+  table_exists=$(q_scalar "SELECT 1 FROM pg_class WHERE relname = '$table' LIMIT 1" 2>/dev/null)
+  if [ -z "$table_exists" ]; then
+    msg_error "Table '$table' not found"
+    return 1
+  fi
+
+  # Auto-detect column if not specified
+  if [ -z "$column" ]; then
+    column=$(q "$(printf "$SQL_PARTITION_COLUMNS" "$table")" 2>/dev/null | grep "date_time" | head -1 | awk '{print $1}')
+    if [ -n "$column" ]; then
+      msg_info "Auto-detected partition column: $column"
+    fi
+  fi
+
+  if [ -z "$column" ]; then
+    msg_error "No partition column specified and no suitable column auto-detected"
+    echo "Please specify with --column"
+    return 1
+  fi
+
+  # Set default start date
+  if [ -z "$start_date" ]; then
+    start_date=$(date '+%Y-%m-01')  # First day of current month
+  fi
+
+  # Generate DDL based on type
+  local ddl_output
+
+  case "$type" in
+    range)
+      ddl_output=$(_partition_generate_range "$table" "$column" "$interval" "$start_date" "$partitions" "$with_data")
+      ;;
+    list)
+      msg_error "LIST partition generation not yet implemented"
+      return 1
+      ;;
+    hash)
+      msg_error "HASH partition generation not yet implemented"
+      return 1
+      ;;
+    *)
+      msg_error "Unknown partition type: $type"
+      return 1
+      ;;
+  esac
+
+  # Output
+  if [ -n "$output_file" ]; then
+    echo "$ddl_output" > "$output_file"
+    colorize green "DDL saved to: $output_file"
+  else
+    echo "$ddl_output"
+  fi
+}
+
 # ============================================
 # WAL & CHECKPOINT
 # ============================================
