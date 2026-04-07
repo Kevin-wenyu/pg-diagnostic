@@ -3220,6 +3220,26 @@ cmd_partition_info()
      ORDER BY parent.relname, child.relname;"
 }
 
+cmd_partition()
+{
+  local subcmd="$1"
+  shift
+
+  case "$subcmd" in
+    info)   cmd_partition_info "$@" ;;
+    advice) cmd_partition_advice "$@" ;;
+    ddl)    cmd_partition_ddl "$@" ;;
+    *)
+      echo "Usage: $EXEC_NAME partition <subcommand> [options]"
+      echo ""
+      echo "Subcommands:"
+      echo "  info [pattern]    - Show partition information"
+      echo "  advice [pattern]  - Show partition advice and recommendations"
+      echo "  ddl [table]       - Show DDL for partitioned table"
+      ;;
+  esac
+}
+
 cmd_partition_summary()
 {
   q "SELECT n.nspname AS schema,
