@@ -24,3 +24,6 @@ __pycache__/
 .pgpass
 *.pem
 *.key
+
+# Claude Code
+.claude/
