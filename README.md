@@ -369,4 +369,4 @@ Kevin
 
 See [Version History](#version-history) in the source code for detailed changes.
 
-### Current Version: 4.1.3 (2026-03-26)
+### Current Version: 4.2.0 (2026-03-27)
