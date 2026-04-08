@@ -1,0 +1,16 @@
+# Ignore files not needed in Docker build
+.git
+.github
+.gitignore
+*.md
+docs/
+.claude/
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store

@@ -4,6 +4,7 @@ A comprehensive command-line tool for PostgreSQL database monitoring, diagnostic
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![PostgreSQL](https://img.shields.io/badge/PostgreSQL-9.6%20--%2018-336791.svg)](https://www.postgresql.org/)
+[![CI](https://github.com/Kevin-wenyu/pg-diagnostic/actions/workflows/ci.yml/badge.svg)](https://github.com/Kevin-wenyu/pg-diagnostic/actions)
 
 ## Features
 
@@ -36,6 +37,30 @@ chmod +x pg
 
 # Optional: Add to PATH
 sudo ln -s $(pwd)/pg /usr/local/bin/pg
+```
+
+### Docker Installation
+
+```bash
+# Pull from GitHub Container Registry
+docker pull ghcr.io/kevin-wenyu/pg-diagnostic:latest
+
+# Or build locally
+docker build -t pg-diagnostic .
+
+# Run with connection parameters
+docker run --rm pg-diagnostic \
+  -h your-host -p 5432 -u postgres -d postgres \
+  ps
+
+# Or with environment variables
+docker run --rm \
+  -e PGHOST=your-host \
+  -e PGPORT=5432 \
+  -e PGUSER=postgres \
+  -e PGPASSWORD=your-password \
+  -e PGDATABASE=postgres \
+  pg-diagnostic ps
 ```
 
 ## Quick Start
