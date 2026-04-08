@@ -2397,13 +2397,17 @@ cmd_partition_advice()
   table=$(q_sanitize "$table")
 
   # Check if table exists
-  local table_info
-  table_info=$(q "$(printf "$SQL_PARTITION_TABLE_STATS" "$table")" 2>/dev/null)
+  local table_exists
+  table_exists=$(q_scalar "SELECT 1 FROM pg_class WHERE relname = '$table' AND relkind = 'r' LIMIT 1" 2>/dev/null)
 
-  if [ -z "$table_info" ]; then
+  if [ -z "$table_exists" ]; then
     msg_error "Table '$table' not found"
     return 1
   fi
+
+  # Get table info
+  local table_info
+  table_info=$(q "$(printf "$SQL_PARTITION_TABLE_STATS" "$table")" 2>/dev/null)
 
   # Check if already partitioned
   local partition_check
