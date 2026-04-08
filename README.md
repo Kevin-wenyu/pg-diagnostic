@@ -73,8 +73,8 @@ The tool supports multiple authentication methods:
 | `running [N]` | Active queries |
 | `blocking` | Enhanced blocking analysis with root cause |
 | `locks` | Lock overview |
-| `kill <pid>` | Terminate session |
-| `cancel <pid>` | Cancel query |
+| `kill <pid> [--force]` | Terminate session (prompts for confirmation) |
+| `cancel <pid> [--force]` | Cancel query (prompts for confirmation) |
 | `sql <pid>` | Show full SQL text |
 
 ### Slow Query Analysis
@@ -139,7 +139,7 @@ The tool supports multiple authentication methods:
 | Command | Description |
 |---------|-------------|
 | `partition advice <table>` | Analyze table and recommend partitioning strategy |
-| `partition ddl <table>` | Generate partition DDL statements |
+| `partition ddl <table>` | Generate partition DDL statements (use `--dry-run` to preview) |
 | `partition info [table]` | Show partition information |
 
 Examples:

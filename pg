@@ -899,8 +899,8 @@ Commands:
     running [N]             Active queries
     blocking                Enhanced blocking analysis with root cause
     locks                   Lock overview
-    kill <pid>              Terminate session
-    cancel <pid>            Cancel query
+    kill <pid> [--force]    Terminate session (prompts for confirmation)
+    cancel <pid> [--force]  Cancel query (prompts for confirmation)
     sql <pid>               Show full SQL text
 
   === SLOW QUERY ANALYSIS ===
@@ -1234,8 +1234,13 @@ q_sanitize()
   local lower_input
   lower_input=$(printf '%s' "$sanitized" | tr '[:upper:]' '[:lower:]')
 
-  # Check for potentially dangerous patterns
-  if [[ "$lower_input" =~ (drop|truncate|delete|insert|update|exec|execute|alter|create|merge|replace|grant|revoke|commit|rollback|begin|transaction|union|select\b.*\bfrom|order\s+by|group\s+by|having|limit|offset|join|into|values|where) ]]; then
+  # Check for potentially dangerous patterns - only match standalone keywords
+  # Use word boundaries to avoid matching substrings within legitimate names
+  # e.g., "selections" contains "select" but should not be flagged
+  local dangerous_pattern='(^|[[:space:]])(drop|truncate|delete|insert|update|exec|execute|alter|create|merge|replace|grant|revoke|commit|rollback|begin|transaction|union)([[:space:]]|$)'
+  local complex_pattern='select[[:space:]]+.*[[:space:]]+from|order[[:space:]]+by|group[[:space:]]+by|having[[:space:]]|limit[[:space:]]|offset[[:space:]]|join[[:space:]]|into[[:space:]]|values[[:space:]]|where[[:space:]]'
+
+  if [[ "$lower_input" =~ $dangerous_pattern ]] || [[ "$lower_input" =~ $complex_pattern ]]; then
     # If dangerous patterns are detected, strip them out
     sanitized=$(printf '%s' "$sanitized" | sed 's/[;,]//g')  # Remove potential statement terminators
     sanitized=$(printf '%s' "$sanitized" | sed 's/[-]{2,}//g')  # Remove comment indicators
@@ -1487,9 +1492,45 @@ cmd_locks()
 
 cmd_kill()
 {
-  local pid=$1
-  [ -z "$pid" ] && { echo "Usage: $EXEC_NAME kill <pid>"; return 1; }
+  local pid=""
+  local force=false
+
+  # Parse options
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+          pid="$1"
+        fi
+        shift ;;
+    esac
+  done
+
+  [ -z "$pid" ] && { echo "Usage: $EXEC_NAME kill <pid> [--force]"; return 1; }
   [[ ! "$pid" =~ ^[0-9]+$ ]] && { echo "Error: PID must be numeric"; return 1; }
+
+  # Show process info before killing
+  local process_info
+  process_info=$(q "SELECT pid, usename, datname, state, left(query, 60) as query FROM pg_stat_activity WHERE pid = $pid;" 2>/dev/null)
+
+  if [ -z "$process_info" ]; then
+    echo "Error: Process $pid not found or no longer exists" >&2
+    return 1
+  fi
+
+  # Confirmation prompt unless --force
+  if [ "$force" != "true" ]; then
+    echo "WARNING: You are about to terminate this process:"
+    echo "$process_info"
+    echo ""
+    printf "Are you sure? [y/N] "
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      return 0
+    fi
+  fi
 
   local result
   # shellcheck disable=SC2059
@@ -1501,14 +1542,50 @@ cmd_kill()
     return $exit_code
   fi
 
-  echo "$result"
+  echo "Process $pid terminated successfully."
 }
 
 cmd_cancel()
 {
-  local pid=$1
-  [ -z "$pid" ] && { echo "Usage: $EXEC_NAME cancel <pid>"; return 1; }
+  local pid=""
+  local force=false
+
+  # Parse options
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --force) force=true; shift ;;
+      *)
+        if [[ "$1" =~ ^[0-9]+$ ]]; then
+          pid="$1"
+        fi
+        shift ;;
+    esac
+  done
+
+  [ -z "$pid" ] && { echo "Usage: $EXEC_NAME cancel <pid> [--force]"; return 1; }
   [[ ! "$pid" =~ ^[0-9]+$ ]] && { echo "Error: PID must be numeric"; return 1; }
+
+  # Show process info before canceling
+  local process_info
+  process_info=$(q "SELECT pid, usename, datname, state, left(query, 60) as query FROM pg_stat_activity WHERE pid = $pid;" 2>/dev/null)
+
+  if [ -z "$process_info" ]; then
+    echo "Error: Process $pid not found or no longer exists" >&2
+    return 1
+  fi
+
+  # Confirmation prompt unless --force
+  if [ "$force" != "true" ]; then
+    echo "WARNING: You are about to cancel the query for this process:"
+    echo "$process_info"
+    echo ""
+    printf "Are you sure? [y/N] "
+    read -r response
+    if [[ ! "$response" =~ ^[Yy]$ ]]; then
+      echo "Cancelled."
+      return 0
+    fi
+  fi
 
   local result
   # shellcheck disable=SC2059
@@ -1520,7 +1597,7 @@ cmd_cancel()
     return $exit_code
   fi
 
-  echo "$result"
+  echo "Query for process $pid cancelled successfully."
 }
 
 cmd_sql()
@@ -2583,6 +2660,7 @@ cmd_partition_ddl()
   local partition_count="16"
   local with_data="false"
   local output_file=""
+  local dry_run="false"
 
   # Parse first argument (table name)
   if [ $# -gt 0 ] && [[ "$1" != --* ]]; then
@@ -2602,6 +2680,7 @@ cmd_partition_ddl()
       --partition-count) partition_count="$2"; shift 2 ;;
       --migrate) with_data="true"; shift ;;
       --output) output_file="$2"; shift 2 ;;
+      --dry-run) dry_run="true"; shift ;;
       *) shift ;;
     esac
   done
@@ -2655,6 +2734,14 @@ cmd_partition_ddl()
 
   # Generate DDL based on type
   local ddl_output
+
+  # Dry-run mode header
+  if [ "$dry_run" = "true" ]; then
+    echo "=== DRY RUN MODE ==="
+    echo "The following SQL would be generated. No changes will be made to the database."
+    echo "Review carefully before executing these statements manually."
+    echo ""
+  fi
 
   case "$type" in
     range)
