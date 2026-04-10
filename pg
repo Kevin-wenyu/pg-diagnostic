@@ -6387,6 +6387,188 @@ cmd_diagnose_replication()
   echo ""
 }
 
+cmd_diagnose_security()
+{
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║             SECURITY AUDIT REPORT                              ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
+  echo "PostgreSQL Version: $(q_scalar "SELECT version();" 2>/dev/null | head -1)"
+  echo ""
+
+  local issues=0
+
+  # Section 1: Superuser Analysis
+  colorize yellow "═══ SECTION 1: SUPERUSER ACCOUNTS ═══"
+  echo ""
+
+  local superuser_count
+  superuser_count=$(q_scalar "SELECT count(*) FROM pg_roles WHERE rolsuper;" 2>/dev/null || echo 0)
+  echo "Superuser accounts: $superuser_count"
+
+  if [ "$superuser_count" -gt 1 ]; then
+    colorize yellow "WARNING: Multiple superuser accounts found ($superuser_count)"
+    echo "Recommendation: Limit superusers to minimal required accounts"
+    issues=$((issues + 1))
+  else
+    colorize green "OK: Appropriate number of superusers"
+  fi
+  echo ""
+
+  echo "Superuser list:"
+  q "SELECT rolname as username, rolvaliduntil as password_expires
+     FROM pg_roles WHERE rolsuper ORDER BY rolname;" 2>/dev/null
+  echo ""
+
+  # Section 2: Password Policy
+  colorize yellow "═══ SECTION 2: PASSWORD STATUS ═══"
+  echo ""
+
+  local no_password_count expired_count
+  no_password_count=$(q_scalar "SELECT count(*) FROM pg_authid WHERE rolpassword IS NULL;" 2>/dev/null || echo 0)
+  expired_count=$(q_scalar "SELECT count(*) FROM pg_authid WHERE rolvaliduntil < now();" 2>/dev/null || echo 0)
+
+  echo "Accounts without password: $no_password_count"
+  if [ "$no_password_count" -gt 0 ]; then
+    colorize yellow "WARNING: $no_password_count accounts have no password"
+    q "SELECT rolname as username FROM pg_authid WHERE rolpassword IS NULL;" 2>/dev/null
+    issues=$((issues + 1))
+  fi
+  echo ""
+
+  echo "Expired passwords: $expired_count"
+  if [ "$expired_count" -gt 0 ]; then
+    colorize red "CRITICAL: $expired_count accounts have expired passwords"
+    q "SELECT rolname as username, rolvaliduntil as expired_at
+       FROM pg_authid WHERE rolvaliduntil < now();" 2>/dev/null
+    issues=$((issues + 1))
+  else
+    colorize green "OK: No expired passwords"
+  fi
+  echo ""
+
+  # Section 3: Public Schema Access
+  colorize yellow "═══ SECTION 3: PUBLIC SCHEMA ACCESS ═══"
+  echo ""
+
+  local public_tables
+  public_tables=$(q_scalar "SELECT count(*) FROM pg_tables WHERE schemaname = 'public';" 2>/dev/null || echo 0)
+  echo "Tables in public schema: $public_tables"
+
+  if [ "$public_tables" -gt 0 ]; then
+    colorize yellow "Note: $public_tables tables exist in public schema"
+    echo "Recommendation: Review if public schema should contain tables"
+  fi
+
+  # Check public schema permissions
+  local public_grants
+  public_grants=$(q_scalar "SELECT count(*) FROM information_schema.usage_privileges
+    WHERE grantee = 'PUBLIC' AND privilege_type = 'USAGE' AND object_type = 'SCHEMA';" 2>/dev/null || echo 0)
+
+  if [ "$public_grants" -gt 0 ]; then
+    colorize yellow "WARNING: PUBLIC has schema privileges"
+    q "SELECT * FROM information_schema.usage_privileges
+       WHERE grantee = 'PUBLIC' AND object_type = 'SCHEMA';" 2>/dev/null
+    issues=$((issues + 1))
+  else
+    colorize green "OK: No excessive PUBLIC privileges"
+  fi
+  echo ""
+
+  # Section 4: Role Membership
+  colorize yellow "═══ SECTION 4: ROLE MEMBERSHIP ANALYSIS ═══"
+  echo ""
+
+  local roles_with_members
+  roles_with_members=$(q_scalar "SELECT count(DISTINCT roleid) FROM pg_auth_members;" 2>/dev/null || echo 0)
+  echo "Roles with member assignments: $roles_with_members"
+
+  if [ "$roles_with_members" -gt 0 ]; then
+    echo ""
+    echo "Role membership details:"
+    q "SELECT r.rolname as role, m.rolname as member, m.admin_option
+       FROM pg_auth_members rm
+       JOIN pg_roles r ON rm.roleid = r.oid
+       JOIN pg_roles m ON rm.member = m.oid
+       ORDER BY r.rolname, m.rolname;" 2>/dev/null
+  fi
+  echo ""
+
+  # Section 5: Connection Settings
+  colorize yellow "═══ SECTION 5: CONNECTION SECURITY ═══"
+  echo ""
+
+  local listen_addresses
+  listen_addresses=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'listen_addresses';" 2>/dev/null || echo "*")
+  echo "listen_addresses: $listen_addresses"
+
+  if [ "$listen_addresses" = "*" ]; then
+    colorize yellow "WARNING: Database accepts connections from any address"
+    issues=$((issues + 1))
+  elif [ "$listen_addresses" = "0.0.0.0" ]; then
+    colorize yellow "WARNING: Database accepts connections from all IPv4 addresses"
+    issues=$((issues + 1))
+  else
+    colorize green "OK: Restricted listen addresses"
+  fi
+  echo ""
+
+  local ssl_enabled
+  ssl_enabled=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'ssl';" 2>/dev/null || echo "off")
+  echo "SSL mode: $ssl_enabled"
+
+  if [ "$ssl_enabled" != "on" ]; then
+    colorize red "CRITICAL: SSL is not enabled"
+    issues=$((issues + 1))
+  else
+    colorize green "OK: SSL is enabled"
+  fi
+  echo ""
+
+  # Section 6: Row-Level Security
+  colorize yellow "═══ SECTION 6: ROW-LEVEL SECURITY ═══"
+  echo ""
+
+  local rls_enabled_count
+  rls_enabled_count=$(q_scalar "SELECT count(*) FROM pg_tables WHERE rowsecurity = true;" 2>/dev/null || echo 0)
+  echo "Tables with Row-Level Security: $rls_enabled_count"
+
+  if [ "$rls_enabled_count" -gt 0 ]; then
+    echo "Tables using RLS:"
+    q "SELECT schemaname, tablename FROM pg_tables WHERE rowsecurity = true;" 2>/dev/null
+  else
+    echo "Note: No tables have Row-Level Security enabled"
+  fi
+  echo ""
+
+  # Summary
+  colorize yellow "═══ SUMMARY ═══"
+  echo ""
+  echo "Security issues found: $issues"
+  echo ""
+
+  if [ "$issues" -eq 0 ]; then
+    colorize green "Security Status: HEALTHY - No critical issues detected"
+  elif [ "$issues" -lt 3 ]; then
+    colorize yellow "Security Status: MODERATE RISK - $issues issue(s) need attention"
+  else
+    colorize red "Security Status: HIGH RISK - $issues issue(s) require immediate attention"
+  fi
+  echo ""
+
+  if [ "$issues" -gt 0 ]; then
+    echo "Recommendations:"
+    echo "  1. Review and limit superuser accounts"
+    echo "  2. Ensure all accounts have strong passwords"
+    echo "  3. Enable SSL for all connections"
+    echo "  4. Restrict listen_addresses to specific IPs"
+    echo "  5. Consider using Row-Level Security for sensitive tables"
+  fi
+  echo ""
+}
+
 cmd_diagnose_slow_query()
 {
   local target_pid="$1"
@@ -6635,6 +6817,7 @@ cmd_diagnose()
     performance|perf)          cmd_diagnose_performance "$@" ;;
     health|full)               cmd_diagnose_health "$@" ;;
     capacity|capacity_plan)    cmd_diagnose_capacity "$@" ;;
+    security|sec)              cmd_diagnose_security "$@" ;;
     *)
       echo "Usage: $EXEC_NAME diagnose <scenario> [options]"
       echo ""
@@ -6646,6 +6829,7 @@ cmd_diagnose()
       echo "  performance          - Performance degradation diagnosis"
       echo "  health               - Comprehensive health check"
       echo "  capacity             - Capacity planning analysis"
+      echo "  security             - Security configuration audit"
       ;;
   esac
 }
