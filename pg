@@ -6569,6 +6569,482 @@ cmd_diagnose_security()
   echo ""
 }
 
+cmd_diagnose_storage()
+{
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║             STORAGE ANALYSIS REPORT                           ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
+  echo "PostgreSQL Version: $(q_scalar "SELECT version();" 2>/dev/null | head -1)"
+  echo ""
+
+  local issues=0
+
+  # Section 1: Tablespace Overview
+  colorize yellow "═══ SECTION 1: TABLESPACE OVERVIEW ═══"
+  echo ""
+
+  local ts_count
+  ts_count=$(q_scalar "SELECT count(*) FROM pg_tablespace;" 2>/dev/null || echo 0)
+  echo "Total tablespaces: $ts_count"
+
+  q "SELECT spcname as tablespace, pg_size_pretty(pg_tablespace_size(oid)) as size
+     FROM pg_tablespace ORDER BY pg_tablespace_size(oid) DESC;" 2>/dev/null
+  echo ""
+
+  # Section 2: Database Size
+  colorize yellow "═══ SECTION 2: DATABASE SIZE ═══"
+  echo ""
+
+  local db_size
+  db_size=$(q_scalar "SELECT pg_size_pretty(pg_database_size(current_database()));" 2>/dev/null)
+  echo "Current database size: $db_size"
+
+  echo ""
+  echo "Top databases by size:"
+  q "SELECT datname as database, pg_size_pretty(pg_database_size(datname)) as size
+     FROM pg_database WHERE datistemplate = false
+     ORDER BY pg_database_size(datname) DESC LIMIT 10;" 2>/dev/null
+  echo ""
+
+  # Section 3: Large Tables
+  colorize yellow "═══ SECTION 3: LARGEST TABLES ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || relname as table,
+      pg_size_pretty(pg_total_relation_size(relid)) as total_size,
+      pg_size_pretty(pg_relation_size(relid)) as table_size,
+      pg_size_pretty(pg_indexes_size(relid)) as index_size,
+      n_live_tup as row_count
+    FROM pg_stat_user_tables
+    ORDER BY pg_total_relation_size(relid) DESC
+    LIMIT 20;" 2>/dev/null
+  echo ""
+
+  # Section 4: TOAST Tables
+  colorize yellow "═══ SECTION 4: TOAST TABLE ANALYSIS ═══"
+  echo ""
+
+  local toast_count
+  toast_count=$(q_scalar "SELECT count(*) FROM pg_class WHERE relkind = 't';" 2>/dev/null || echo 0)
+  echo "TOAST tables count: $toast_count"
+
+  if [ "$toast_count" -gt 0 ]; then
+    echo ""
+    echo "Top TOAST tables by size:"
+    q "SELECT
+        c.relname as toast_table,
+        pg_size_pretty(pg_total_relation_size(c.oid)) as size,
+        c.relpages as pages
+      FROM pg_class c
+      WHERE c.relkind = 't'
+      ORDER BY c.relpages DESC
+      LIMIT 10;" 2>/dev/null
+  fi
+  echo ""
+
+  # Section 5: Storage Issues
+  colorize yellow "═══ SECTION 5: STORAGE WARNINGS ═══"
+  echo ""
+
+  # Check for tables without indexes (heap only)
+  local heap_only
+  heap_only=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables
+    WHERE idx_scan = 0 AND seq_scan > 100;" 2>/dev/null || echo 0)
+
+  echo "Tables with high sequential scans but no index usage: $heap_only"
+  if [ "$heap_only" -gt 0 ]; then
+    colorize yellow "WARNING: $heap_only tables may benefit from indexes"
+    q "SELECT schemaname || '.' || relname as table, seq_scan
+       FROM pg_stat_user_tables
+       WHERE idx_scan = 0 AND seq_scan > 100
+       ORDER BY seq_scan DESC LIMIT 5;" 2>/dev/null
+    issues=$((issues + 1))
+  fi
+  echo ""
+
+  # Check for missing primary keys
+  local no_pk
+  no_pk=$(q_scalar "SELECT count(*) FROM information_schema.table_constraints
+    WHERE constraint_type = 'PRIMARY KEY';" 2>/dev/null || echo 0)
+  local total_tables
+  total_tables=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables;" 2>/dev/null || echo 0)
+
+  echo "Tables without primary key: $((total_tables - no_pk))"
+  if [ "$((total_tables - no_pk))" -gt 0 ]; then
+    colorize yellow "Note: Some tables lack primary keys"
+  fi
+  echo ""
+
+  # Section 6: Schema Size Distribution
+  colorize yellow "═══ SECTION 6: SCHEMA SIZE DISTRIBUTION ═══"
+  echo ""
+
+  q "SELECT
+      schemaname as schema,
+      count(*) as tables,
+      pg_size_pretty(sum(pg_total_relation_size(relid))) as total_size
+    FROM pg_stat_user_tables
+    GROUP BY schemaname
+    ORDER BY sum(pg_total_relation_size(relid)) DESC;" 2>/dev/null
+  echo ""
+
+  # Summary
+  colorize yellow "═══ SUMMARY ═══"
+  echo ""
+  echo "Storage issues found: $issues"
+  echo ""
+
+  if [ "$issues" -eq 0 ]; then
+    colorize green "Storage Status: HEALTHY"
+  else
+    colorize yellow "Storage Status: $issues issue(s) need attention"
+  fi
+
+  echo ""
+  echo "Recommendations:"
+  echo "  1. Monitor large tables for partitioning opportunities"
+  echo "  2. Review TOAST usage for large column tables"
+  echo "  3. Add indexes to tables with high sequential scans"
+  echo "  4. Consider primary keys for all tables"
+  echo ""
+}
+
+cmd_diagnose_index()
+{
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║             INDEX ANALYSIS REPORT                              ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
+  echo ""
+
+  local issues=0
+
+  # Section 1: Index Overview
+  colorize yellow "═══ SECTION 1: INDEX OVERVIEW ═══"
+  echo ""
+
+  local total_indexes
+  total_indexes=$(q_scalar "SELECT count(*) FROM pg_indexes WHERE schemaname = 'public';" 2>/dev/null || echo 0)
+  local total_tables
+  total_tables=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables;" 2>/dev/null || echo 0)
+
+  echo "Total indexes: $total_indexes"
+  echo "Total tables: $total_tables"
+  echo "Average indexes per table: $(echo "scale=2; $total_indexes / $total_tables" | bc 2>/dev/null || echo "N/A")"
+  echo ""
+
+  # Section 2: Unused Indexes
+  colorize yellow "═══ SECTION 2: UNUSED INDEXES ═══"
+  echo ""
+
+  local unused_count
+  unused_count=$(q_scalar "SELECT count(*) FROM pg_stat_user_indexes
+    WHERE idx_scan = 0;" 2>/dev/null || echo 0)
+
+  echo "Unused indexes: $unused_count"
+
+  if [ "$unused_count" -gt 0 ]; then
+    colorize yellow "WARNING: $unused_count indexes have never been used"
+    echo ""
+    echo "Top unused indexes by size:"
+    q "SELECT
+        schemaname || '.' || tablename as table,
+        indexname as index,
+        pg_size_pretty(pg_relation_size(indexrelid)) as size
+      FROM pg_stat_user_indexes
+      WHERE idx_scan = 0 AND pg_relation_size(indexrelid) > 1024*1024
+      ORDER BY pg_relation_size(indexrelid) DESC
+      LIMIT 10;" 2>/dev/null
+    issues=$((issues + 1))
+  else
+    colorize green "OK: All indexes have been used"
+  fi
+  echo ""
+
+  # Section 3: Duplicate Indexes
+  colorize yellow "═══ SECTION 3: DUPLICATE/REDUNDANT INDEXES ═══"
+  echo ""
+
+  local dup_count
+  dup_count=$(q_scalar "SELECT count(*) FROM (
+    SELECT indexrelname, indrelid, indkey
+    FROM pg_index
+    WHERE indexprs IS NULL AND indpred IS NULL
+    GROUP BY indexrelname, indrelid, indkey
+    HAVING count(*) > 1
+  ) sub;" 2>/dev/null || echo 0)
+
+  echo "Potential duplicate indexes: $dup_count"
+
+  if [ "$dup_count" -gt 0 ]; then
+    colorize yellow "WARNING: Found $dup_count sets of duplicate indexes"
+    q "SELECT
+        schemaname || '.' || t.relname as table,
+        array_agg(i.relname) as indexes,
+        pg_size_pretty(sum(pg_relation_size(i.oid))) as total_size
+      FROM pg_index idx
+      JOIN pg_class t ON idx.indrelid = t.oid
+      JOIN pg_class i ON idx.indexrelid = i.oid
+      JOIN pg_namespace n ON t.relnamespace = n.oid
+      WHERE indexprs IS NULL AND indpred IS NULL
+      GROUP BY schemaname, t.relname, idx.indkey
+      HAVING count(*) > 1
+      LIMIT 10;" 2>/dev/null
+    issues=$((issues + 1))
+  else
+    colorize green "OK: No duplicate indexes found"
+  fi
+  echo ""
+
+  # Section 4: Large Indexes
+  colorize yellow "═══ SECTION 4: LARGEST INDEXES ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || tablename as table,
+      indexname as index,
+      pg_size_pretty(pg_relation_size(indexrelid)) as size,
+      idx_scan as scans,
+      idx_tup_read as tuples_read,
+      idx_tup_fetch as tuples_fetch
+    FROM pg_stat_user_indexes
+    ORDER BY pg_relation_size(indexrelid) DESC
+    LIMIT 15;" 2>/dev/null
+  echo ""
+
+  # Section 5: Missing Indexes Candidates
+  colorize yellow "═══ SECTION 5: POTENTIAL MISSING INDEXES ═══"
+  echo ""
+
+  local seq_scan_tables
+  seq_scan_tables=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables WHERE seq_scan > 1000;" 2>/dev/null || echo 0)
+
+  echo "Tables with high sequential scan count (>1000): $seq_scan_tables"
+
+  if [ "$seq_scan_tables" -gt 0 ]; then
+    colorize yellow "These tables may benefit from indexes:"
+    q "SELECT
+        schemaname || '.' || relname as table,
+        seq_scan,
+        seq_tup_read,
+        n_live_tup as rows
+      FROM pg_stat_user_tables
+      WHERE seq_scan > 1000
+      ORDER BY seq_scan DESC
+      LIMIT 10;" 2>/dev/null
+    issues=$((issues + 1))
+  else
+    colorize green "OK: No tables with excessive sequential scans"
+  fi
+  echo ""
+
+  # Section 6: Index Usage Ratio
+  colorize yellow "═══ SECTION 6: INDEX USAGE RATIO ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || tablename as table,
+      COALESCE(idx_scan, 0) as index_scans,
+      COALESCE(seq_scan, 0) as sequential_scans,
+      CASE WHEN (idx_scan + seq_scan) > 0
+        THEN round(100.0 * idx_scan / (idx_scan + seq_scan), 1)
+        ELSE 0 END as index_usage_pct
+    FROM pg_stat_user_tables
+    WHERE (idx_scan + seq_scan) > 100
+    ORDER BY (idx_scan + seq_scan) DESC
+    LIMIT 10;" 2>/dev/null
+  echo ""
+
+  # Summary
+  colorize yellow "═══ SUMMARY ═══"
+  echo ""
+  echo "Index issues found: $issues"
+  echo ""
+
+  if [ "$issues" -eq 0 ]; then
+    colorize green "Index Status: HEALTHY"
+  else
+    colorize yellow "Index Status: $issues issue(s) need attention"
+  fi
+
+  echo ""
+  echo "Recommendations:"
+  echo "  1. Drop unused indexes to reduce write overhead"
+  echo "  2. Remove duplicate indexes"
+  echo "  3. Add indexes on frequently queried columns"
+  echo "  4. Consider covering indexes for read-heavy queries"
+  echo ""
+}
+
+cmd_diagnose_vacuum()
+{
+  echo "╔════════════════════════════════════════════════════════════════╗"
+  echo "║             VACUUM & MAINTENANCE REPORT                        ║"
+  echo "╚════════════════════════════════════════════════════════════════╝"
+  echo ""
+  echo "Generated at: $(date '+%Y-%m-%d %H:%M:%S')"
+  echo "Database: $DBNAME @ $DBHOST:$DBPORT"
+  echo ""
+
+  local issues=0
+
+  # Section 1: Vacuum Status Overview
+  colorize yellow "═══ SECTION 1: VACUUM STATUS OVERVIEW ═══"
+  echo ""
+
+  local last_vacuum_old
+  last_vacuum_old=$(q_scalar "SELECT min(last_vacuum) FROM pg_stat_user_tables;" 2>/dev/null)
+  local last_analyze_old
+  last_analyze_old=$(q_scalar "SELECT min(last_analyze) FROM pg_stat_user_tables;" 2>/dev/null)
+
+  echo "Last vacuum (oldest): ${last_vacuum_old:-never}"
+  echo "Last analyze (oldest): ${last_analyze_old:-never}"
+  echo ""
+
+  # Section 2: Tables Needing Vacuum
+  colorize yellow "═══ SECTION 2: TABLES NEEDING VACUUM ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || relname as table,
+      n_dead_tup as dead_tuples,
+      n_live_tup as live_tuples,
+      CASE WHEN n_live_tup > 0
+        THEN round(100.0 * n_dead_tup / n_live_tup, 2)
+        ELSE 0 END as dead_pct,
+      last_vacuum as last_vacuum,
+      last_autovacuum as last_autovacuum
+    FROM pg_stat_user_tables
+    WHERE n_dead_tup > 1000
+    ORDER BY n_dead_tup DESC
+    LIMIT 15;" 2>/dev/null
+  echo ""
+
+  # Check for high dead tuple percentage
+  local high_dead
+  high_dead=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables
+    WHERE n_live_tup > 0 AND 100.0 * n_dead_tup / n_live_tup > 10;" 2>/dev/null || echo 0)
+
+  if [ "$high_dead" -gt 0 ]; then
+    colorize yellow "WARNING: $high_dead tables have >10% dead tuples"
+    issues=$((issues + 1))
+  fi
+  echo ""
+
+  # Section 3: Tables Needing Analyze
+  colorize yellow "═══ SECTION 3: TABLES NEEDING ANALYZE ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || relname as table,
+      n_distinct,
+      last_analyze,
+      last_autoanalyze
+    FROM pg_stat_user_tables
+    WHERE last_analyze IS NULL
+      OR last_autoanalyze IS NULL
+      OR now() - COALESCE(last_analyze, last_autoanalyze) > interval '7 days'
+    ORDER BY now() - COALESCE(last_analyze, last_autoanalyze) DESC
+    LIMIT 10;" 2>/dev/null
+  echo ""
+
+  # Check for stale statistics
+  local stale_stats
+  stale_stats=$(q_scalar "SELECT count(*) FROM pg_stat_user_tables
+    WHERE now() - COALESCE(last_analyze, last_autoanalyze) > interval '7 days';" 2>/dev/null || echo 0)
+
+  if [ "$stale_stats" -gt 0 ]; then
+    colorize yellow "WARNING: $stale_stats tables have stale statistics (>7 days)"
+    issues=$((issues + 1))
+  fi
+  echo ""
+
+  # Section 4: Table Bloat
+  colorize yellow "═══ SECTION 4: TABLE BLOAT ANALYSIS ═══"
+  echo ""
+
+  q "SELECT
+      schemaname || '.' || relname as table,
+      pg_size_pretty(pg_total_relation_size(relid)) as total_size,
+      CASE WHEN pg_total_relation_size(relid) > 0
+        THEN round(100.0 * (pg_total_relation_size(relid) - pg_relation_size(relid))
+          / pg_total_relation_size(relid), 1)
+        ELSE 0 END as bloat_pct
+    FROM pg_stat_user_tables
+    ORDER BY pg_total_relation_size(relid) - pg_relation_size(relid) DESC
+    LIMIT 15;" 2>/dev/null
+  echo ""
+
+  # Section 5: Autovacuum Settings
+  colorize yellow "═══ SECTION 5: AUTOVACUUM SETTINGS ═══"
+  echo ""
+
+  local autovacuum_enabled
+  autovacuum_enabled=$(q_scalar "SELECT setting FROM pg_settings WHERE name = 'autovacuum';" 2>/dev/null || echo "on")
+
+  echo "Autovacuum enabled: $autovacuum_enabled"
+
+  if [ "$autovacuum_enabled" != "on" ]; then
+    colorize red "CRITICAL: Autovacuum is disabled!"
+    issues=$((issues + 1))
+  else
+    colorize green "OK: Autovacuum is enabled"
+  fi
+  echo ""
+
+  echo "Autovacuum parameters:"
+  q "SELECT name, setting, unit FROM pg_settings
+     WHERE name LIKE 'autovacuum_%' AND name NOT LIKE '%_cost%'
+     ORDER BY name;" 2>/dev/null
+  echo ""
+
+  # Section 6: Current Vacuum Activity
+  colorize yellow "═══ SECTION 6: CURRENT VACUUM ACTIVITY ═══"
+  echo ""
+
+  local running_vacuum
+  running_vacuum=$(q_scalar "SELECT count(*) FROM pg_stat_progress_vacuum;" 2>/dev/null || echo 0)
+
+  echo "Running vacuum operations: $running_vacuum"
+
+  if [ "$running_vacuum" -gt 0 ]; then
+    q "SELECT
+        relname as table,
+        phase,
+        round(100.0 * heap_blks_scanned / NULLIF(heap_blks_total, 0), 1) as progress_pct
+      FROM pg_stat_progress_vacuum;" 2>/dev/null
+  else
+    echo "No vacuum operations currently running"
+  fi
+  echo ""
+
+  # Summary
+  colorize yellow "═══ SUMMARY ═══"
+  echo ""
+
+  if [ "$issues" -eq 0 ]; then
+    colorize green "Vacuum Status: HEALTHY"
+  elif [ "$issues" -lt 3 ]; then
+    colorize yellow "Vacuum Status: $issues issue(s) need attention"
+  else
+    colorize red "Vacuum Status: $issues issue(s) require immediate attention"
+  fi
+
+  echo ""
+  echo "Recommendations:"
+  echo "  1. Run VACUUM ANALYZE on tables with high dead tuples"
+  echo "  2. Monitor autovacuum settings for optimal performance"
+  echo "  3. Consider manual vacuum for heavily updated tables"
+  echo "  4. Review vacuum_cost_delay for maintenance window constraints"
+  echo ""
+}
+
 cmd_diagnose_slow_query()
 {
   local target_pid="$1"
@@ -6818,6 +7294,9 @@ cmd_diagnose()
     health|full)               cmd_diagnose_health "$@" ;;
     capacity|capacity_plan)    cmd_diagnose_capacity "$@" ;;
     security|sec)              cmd_diagnose_security "$@" ;;
+    storage|store)             cmd_diagnose_storage "$@" ;;
+    index|idx)                 cmd_diagnose_index "$@" ;;
+    vacuum|vac)                cmd_diagnose_vacuum "$@" ;;
     *)
       echo "Usage: $EXEC_NAME diagnose <scenario> [options]"
       echo ""
@@ -6830,6 +7309,9 @@ cmd_diagnose()
       echo "  health               - Comprehensive health check"
       echo "  capacity             - Capacity planning analysis"
       echo "  security             - Security configuration audit"
+      echo "  storage              - Storage and tablespace analysis"
+      echo "  index                - Index usage and optimization"
+      echo "  vacuum               - Vacuum and maintenance status"
       ;;
   esac
 }
