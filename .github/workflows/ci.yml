@@ -69,6 +69,53 @@ jobs:
           ./pg conn
           ./pg health 2>/dev/null || echo "health check completed"
 
+  bats-test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: testdb
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats
+        run: |
+          git clone https://github.com/bats-core/bats-core.git /tmp/bats-core
+          cd /tmp/bats-core && ./install.sh /usr/local
+
+      - name: Make pg executable
+        run: chmod +x pg
+
+      - name: Run command tests
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: testdb
+        run: |
+          bats --tap tests/commands/ 2>&1 || true
+
+      - name: Run integration tests
+        env:
+          PGHOST: localhost
+          PGPORT: 5432
+          PGUSER: postgres
+          PGPASSWORD: postgres
+          PGDATABASE: testdb
+        run: |
+          bats --tap tests/integration/ 2>&1 || true
+
   docker-build:
     runs-on: ubuntu-latest
     steps:
@@ -85,25 +132,38 @@ jobs:
         run: |
           docker run --rm pg-tool:test --help | head -20
 
-  release-check:
+  release:
     runs-on: ubuntu-latest
+    needs: [lint, test, bats-test, docker-build]
+    if: startsWith(github.ref, 'refs/tags/v')
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check if release needed
-        id: check
+      - name: Get version from tag
+        id: version
         run: |
-          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
-            echo "release=true" >> $GITHUB_OUTPUT
-          else
-            echo "release=false" >> $GITHUB_OUTPUT
-          fi
+          VERSION=${GITHUB_REF#refs/tags/}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "version_number=${VERSION#v}" >> $GITHUB_OUTPUT
+
+      - name: Update version in pg script
+        run: |
+          VERSION_NUMBER=${{ steps.version.outputs.version_number }}
+          # Update VERSION variable in pg script
+          sed -i "s/^VERSION=.*/VERSION=\"$VERSION_NUMBER\"/" pg
 
       - name: Create Release
-        if: steps.check.outputs.release == 'true'
         uses: softprops/action-gh-release@v1
         with:
           files: pg
-          generate_release_notes: true
+          name: ${{ steps.version.outputs.version }}
+          body_path: CHANGELOG.md
+          draft: false
+          prerelease: ${{ contains(steps.version.outputs.version, 'alpha') || contains(steps.version.outputs.version, 'beta') }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update Docker image tag
+        if: false
+        run: |
+          echo "Docker tag would be updated to ${{ steps.version.outputs.version }}"

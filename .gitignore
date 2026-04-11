@@ -27,3 +27,7 @@ __pycache__/
 
 # Claude Code
 .claude/
+
+# Test output
+test-results/
+*.log
